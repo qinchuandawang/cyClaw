@@ -9,6 +9,9 @@ authors.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 cyclaw-change-radar = { path = "../cyclaw-change-radar" }
+cyclaw-docs = { path = "../cyclaw-docs" }
+cyclaw-knowledge = { path = "../cyclaw-knowledge" }
+cyclaw-retrieval = { path = "../cyclaw-retrieval" }
 cyclaw-scanner = { path = "../cyclaw-scanner" }
 serde.workspace = true
 serde_json.workspace = true

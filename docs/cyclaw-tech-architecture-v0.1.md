@@ -9,7 +9,8 @@
 ```text
 Rust Core First
 Tauri + React Desktop
-Rust CLI First
+Rust Agent Core
+Rust CLI as Debug Entry
 Markdown + SQLite + JSONL Storage
 Git Diff + Rule Engine + LLM Hybrid Analysis
 Patch-based Document Update
@@ -23,6 +24,10 @@ MCP Server as Integration Layer
 > cyClaw 的核心引擎应该用 Rust，界面和交互层用 TypeScript / React。
 
 这不是因为 Rust 热门，而是因为 cyClaw 的核心问题更像“本地可信知识引擎”，不是“网页聊天应用”。
+
+需要明确的是：
+
+> CLI 不是 cyClaw 的最终用户形态。CLI 是核心能力的调试入口、自动化入口和 IDE/桌面端复用入口。真正的使用体验应该是本地 Agent 常驻监听项目变化，桌面端或 IDE 负责展示提醒、知识收件箱和确认动作。
 
 ## 2. 为什么重新调整
 

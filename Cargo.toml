@@ -3,6 +3,9 @@ members = [
   "crates/cyclaw-change-radar",
   "crates/cyclaw-cli",
   "crates/cyclaw-core",
+  "crates/cyclaw-docs",
+  "crates/cyclaw-knowledge",
+  "crates/cyclaw-retrieval",
   "crates/cyclaw-scanner",
 ]
 resolver = "2"
@@ -20,4 +23,5 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"

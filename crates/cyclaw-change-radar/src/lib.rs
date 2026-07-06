@@ -109,6 +109,15 @@ pub fn analyze_git_changes(project_root: &Path) -> Result<ChangeAnalysis> {
     })
 }
 
+pub fn git_change_fingerprint(project_root: &Path) -> Result<String> {
+    ensure_git_repository(project_root)?;
+
+    let status_output = run_git(project_root, &["status", "--porcelain"])?;
+    let name_status_output = run_git(project_root, &["diff", "--name-status"])?;
+
+    Ok(format!("{}\n{}", status_output, name_status_output))
+}
+
 pub fn classify_path(path: &str) -> Vec<ChangeType> {
     let normalized = path.replace('\\', "/");
     let lower = normalized.to_lowercase();
