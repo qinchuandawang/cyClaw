@@ -8,15 +8,16 @@
 
 ```text
 Rust Core First
-Tauri + React Desktop
 Rust Agent Core
 Rust CLI as Debug Entry
 Markdown + SQLite + JSONL Storage
 Git Diff + Rule Engine + LLM Hybrid Analysis
 Patch-based Document Update
 Local Event Bus + Hook Pipeline
-OpenAI-compatible Model Gateway
 MCP Server as Integration Layer
+Plugin/IDE Integration
+Tauri + React Desktop Later
+OpenAI-compatible Model Gateway Later
 ```
 
 一句话结论：
@@ -27,7 +28,7 @@ MCP Server as Integration Layer
 
 需要明确的是：
 
-> CLI 不是 cyClaw 的最终用户形态。CLI 是核心能力的调试入口、自动化入口和 IDE/桌面端复用入口。真正的使用体验应该是本地 Agent 常驻监听项目变化，桌面端或 IDE 负责展示提醒、知识收件箱和确认动作。
+> CLI 不是 cyClaw 的最终用户形态。CLI 是核心能力的调试入口、自动化入口和 MCP/插件复用入口。正确推进顺序是先稳定 CLI/Core，再做 MCP/插件让 Codex、Claude Code、Cursor 等工具能接入项目知识，最后再做 Web/桌面客户端。
 
 ## 2. 为什么重新调整
 
@@ -578,17 +579,7 @@ cyClaw 的定位不是改代码，因此默认不需要修改源码文件。
 - `cyclaw search`
 - SQLite FTS5 检索 docs、`.cyclaw/memory.md`、知识收件箱、历史任务。
 
-### 阶段 6：Tauri 桌面面板
-
-目标：
-
-- 展示知识资产目录。
-- 展示变更雷达。
-- 展示知识收件箱。
-- 展示文档 diff。
-- 支持人工确认。
-
-### 阶段 7：MCP Server
+### 阶段 6：MCP Server
 
 目标：
 
@@ -596,14 +587,32 @@ cyClaw 的定位不是改代码，因此默认不需要修改源码文件。
 - 让 Codex、Claude Code、Cursor 等工具查询 cyClaw 项目记忆。
 - 让 AI 编码工具在改代码前知道项目规则和历史坑点。
 
+### 阶段 7：插件集成
+
+目标：
+
+- VS Code / Cursor 插件。
+- JetBrains 插件规划。
+- 插件负责启动 Agent、展示状态、发送确认动作。
+
+### 阶段 8：Web/桌面客户端
+
+目标：
+
+- Tauri + React 桌面面板。
+- Web 管理界面。
+- 展示知识资产目录、变更雷达、知识收件箱、文档 diff 和搜索结果。
+
 ## 12. 最终推荐
 
 当前最适合 cyClaw 的选择是：
 
 ```text
 主语言：Rust
-桌面 UI：Tauri + React + TypeScript
-CLI：Rust
+CLI/Core：Rust
+MCP Server：Rust
+插件：VS Code/Cursor 优先，JetBrains 后续规划
+Web/桌面客户端：Tauri + React + TypeScript 后置
 核心存储：Markdown + SQLite + JSONL
 检索：SQLite FTS5 优先，向量检索后置
 分析：Git diff + 规则引擎 + Tree-sitter + LLM
@@ -613,7 +622,7 @@ CLI：Rust
 
 核心原则：
 
-> 用 Rust 承担本地可信核心，用 TypeScript 承担交互效率，用 Markdown 和 SQLite 承担长期项目记忆。
+> 用 Rust 承担本地可信核心和 MCP 集成层，用 TypeScript 承担插件与客户端交互效率，用 Markdown 和 SQLite 承担长期项目记忆。
 
 这个选择未必最常见，也不是为了追热点。它更符合 cyClaw 的产品本质：
 

@@ -24,13 +24,14 @@ cyClaw 的目标不是做一个通用 AI 编码工具，而是做：
 Rust Agent Core
 Rust CLI 调试入口
 Rust Core Engine
-Tauri + React 桌面知识面板
 Markdown + SQLite + JSONL 本地存储
 Git Diff 变更雷达
 知识收件箱
 文档 Patch 更新
 本地知识检索
 MCP Server
+插件/MCP 集成层
+Web/桌面客户端后置
 ```
 
 说明：
@@ -38,7 +39,7 @@ MCP Server
 CLI 是工程入口，不是最终用户的主要使用方式。cyClaw 的最终使用形态应该是：
 
 ```text
-用户打开项目 -> cyClaw Agent 自动启动 -> 自动监听变更 -> 自动生成知识建议 -> 用户在桌面端或 IDE 中确认
+用户打开 AI 编码工具或 IDE -> cyClaw MCP/插件被调用 -> 自动读取项目知识 -> 需要确认时再进入客户端面板
 ```
 
 ## 3. 成功标准
@@ -57,8 +58,8 @@ MVP 成功标准：
 5. 能生成文档更新草稿和 diff。
 6. 用户确认后能写入 `docs/` 或 `.cyclaw/`。
 7. 能索引 Markdown 和知识收件箱，并支持本地检索。
-8. 能通过桌面面板查看变更雷达、知识收件箱和文档 patch。
-9. 能通过 MCP 提供项目知识查询能力。
+8. 能通过 MCP 提供项目知识查询能力。
+9. 能通过插件或后续客户端查看变更雷达、知识收件箱和文档 patch。
 10. 默认不会修改源码文件，不会静默上传项目内容。
 
 ## 4. 总体阶段
@@ -73,9 +74,10 @@ MVP 成功标准：
 阶段 4：知识收件箱
 阶段 5：文档草稿与 Patch
 阶段 6：本地索引与检索
-阶段 7：桌面知识面板
-阶段 8：MCP 与外部集成
+阶段 7：MCP 与外部集成
+阶段 8：插件集成
 阶段 9：产品打磨与发布
+阶段 10：Web/桌面客户端
 ```
 
 每个阶段都必须有可运行命令、测试样例和可验收产物。
@@ -458,13 +460,85 @@ search_index
 - 已索引 `docs/`、`wiki/`、`README.md`、`.cyclaw/project.md`、`.cyclaw/knowledge-inbox.jsonl`、`.cyclaw/doc-patches/`、`.cyclaw/runs/`。
 - 已生成 `.cyclaw/index.sqlite`。
 
-## 12. 阶段 7：桌面知识面板
+## 12. 阶段 7：MCP 与外部集成
 
 ### 12.1 目标
 
-实现 Tauri + React 桌面端，把 Agent Runtime 能力变成可视化工作台。
+让 Codex、Claude Code、Cursor 等工具可以调用 cyClaw 查询项目记忆。
 
-### 12.2 页面
+### 12.2 任务
+
+1. 实现 `cyclaw mcp`。
+2. 提供 MCP tools：
+   - `get_project_profile`
+   - `search_project_knowledge`
+   - `list_pending_knowledge`
+   - `suggest_doc_updates`
+   - `get_project_rules`
+3. 提供 MCP resources：
+   - `.cyclaw/project.md`
+   - `.cyclaw/memory.md`
+   - `docs/*`
+4. 编写 Claude Code / Codex 接入说明。
+
+### 12.3 验收标准
+
+- MCP Server 可启动。
+- 外部 AI 工具能查询项目知识。
+- 查询结果包含来源。
+- 不允许外部工具直接绕过确认写入文档。
+
+## 13. 阶段 8：插件集成
+
+### 13.1 目标
+
+先接入开发者已经使用的编辑器和 AI 编码工具，而不是先做完整客户端。
+
+### 13.2 任务
+
+1. VS Code / Cursor 插件：
+   - 启动或连接 `cyclaw mcp`。
+   - 展示 `cyclaw status`。
+   - 展示 pending 知识和文档草稿。
+   - 调用 accept / ignore / apply。
+2. JetBrains 插件规划：
+   - 先形成协议和命令约定。
+   - 后续再实现 IntelliJ IDEA / RustRover 插件。
+3. 插件不复制 core 逻辑，只调用 CLI/MCP。
+
+### 13.3 验收标准
+
+- 插件能在当前项目里读取 cyClaw 状态。
+- 插件能展示知识收件箱和文档草稿。
+- 插件能触发用户确认动作。
+
+## 14. 阶段 9：产品打磨与发布
+
+### 14.1 目标
+
+让 cyClaw 可以被真实用户安装、试用、反馈。
+
+### 14.2 任务
+
+1. 打包 CLI。
+2. 打包 MCP Server。
+3. 编写安装说明。
+4. 编写快速开始。
+5. 准备示例项目。
+6. 增加错误诊断。
+7. 增加日志导出。
+8. 做跨平台测试：
+   - Windows
+   - macOS
+   - Linux
+
+## 15. 阶段 10：Web/桌面客户端
+
+### 15.1 目标
+
+在 CLI/Core、MCP 和插件稳定后，再实现 Tauri + React 或 Web 客户端，把 Agent Runtime 能力变成完整可视化工作台。
+
+### 15.2 页面
 
 1. 项目首页
    - 当前工作区。
@@ -492,15 +566,7 @@ search_index
    - 来源结果。
    - 片段预览。
 
-### 12.3 设计原则
-
-- 不做营销首页。
-- 第一屏就是项目知识状态。
-- 不用聊天框作为唯一入口。
-- 所有写入动作必须有 diff。
-- 所有 AI 结论必须有来源。
-
-### 12.4 验收标准
+### 15.3 验收标准
 
 - 能选择或打开一个项目目录。
 - 能展示扫描结果。
@@ -509,54 +575,6 @@ search_index
 - 能预览和应用文档 patch。
 - 能搜索已有知识。
 
-## 13. 阶段 8：MCP 与外部集成
-
-### 13.1 目标
-
-让 Codex、Claude Code、Cursor 等工具可以调用 cyClaw 查询项目记忆。
-
-### 13.2 任务
-
-1. 实现 `cyclaw mcp`。
-2. 提供 MCP tools：
-   - `get_project_profile`
-   - `search_project_knowledge`
-   - `list_pending_knowledge`
-   - `suggest_doc_updates`
-   - `get_project_rules`
-3. 提供 MCP resources：
-   - `.cyclaw/project.md`
-   - `.cyclaw/memory.md`
-   - `docs/*`
-4. 编写 Claude Code / Codex 接入说明。
-
-### 13.3 验收标准
-
-- MCP Server 可启动。
-- 外部 AI 工具能查询项目知识。
-- 查询结果包含来源。
-- 不允许外部工具直接绕过确认写入文档。
-
-## 14. 阶段 9：产品打磨与发布
-
-### 14.1 目标
-
-让 cyClaw 可以被真实用户安装、试用、反馈。
-
-### 14.2 任务
-
-1. 打包 CLI。
-2. 打包桌面端。
-3. 编写安装说明。
-4. 编写快速开始。
-5. 准备示例项目。
-6. 增加错误诊断。
-7. 增加日志导出。
-8. 做跨平台测试：
-   - Windows
-   - macOS
-   - Linux
-
 ### 14.3 验收标准
 
 - 用户能在 5 分钟内完成安装和 `cyclaw init`。
@@ -564,9 +582,9 @@ search_index
 - 用户能接受候选知识并写入文档。
 - 用户能搜索刚刚写入的知识。
 
-## 15. 测试计划
+## 16. 测试计划
 
-### 15.1 单元测试
+### 16.1 单元测试
 
 重点覆盖：
 
@@ -578,7 +596,7 @@ search_index
 - patch 生成。
 - SQLite 索引。
 
-### 15.2 Fixture 测试
+### 16.2 Fixture 测试
 
 准备 fixture 项目：
 
@@ -599,7 +617,7 @@ fixtures/
 - 预期知识候选。
 - 预期文档更新。
 
-### 15.3 端到端测试
+### 16.3 端到端测试
 
 端到端链路：
 
@@ -607,7 +625,7 @@ fixtures/
 init -> scan -> diff -> inbox -> draft -> apply -> index -> search
 ```
 
-### 15.4 桌面测试
+### 16.4 桌面测试
 
 重点检查：
 
@@ -617,9 +635,9 @@ init -> scan -> diff -> inbox -> draft -> apply -> index -> search
 - 知识收件箱状态正确。
 - 写入前确认明确。
 
-## 16. 风险与控制
+## 17. 风险与控制
 
-### 16.1 噪音过多
+### 17.1 噪音过多
 
 风险：
 
@@ -632,7 +650,7 @@ cyClaw 产生太多“建议更新文档”，用户会忽略。
 - 支持忽略规则。
 - 支持项目级阈值配置。
 
-### 16.2 文档被污染
+### 17.2 文档被污染
 
 风险：
 
@@ -645,7 +663,7 @@ AI 自动写入低质量内容。
 - 必须 diff 预览。
 - 用户确认后应用。
 
-### 16.3 模型输出不稳定
+### 17.3 模型输出不稳定
 
 风险：
 
@@ -658,7 +676,7 @@ AI 自动写入低质量内容。
 - 模型只做语义和草稿，不做边界判断。
 - 规则和 AST 优先。
 
-### 16.4 隐私问题
+### 17.4 隐私问题
 
 风险：
 
@@ -671,7 +689,7 @@ AI 自动写入低质量内容。
 - 显示将发送的上下文摘要。
 - 支持本地模型。
 
-### 16.5 Rust 开发速度
+### 17.5 Rust 开发速度
 
 风险：
 
@@ -684,7 +702,7 @@ Rust-first 会降低早期迭代速度。
 - 模型提示词和规则外置为 Markdown/YAML。
 - UI 后置。
 
-## 17. 开发优先级
+## 18. 开发优先级
 
 P0：
 
@@ -699,26 +717,27 @@ P0：
 P1：
 
 - SQLite 检索。
-- Tauri 桌面面板。
-- 模型网关。
-- 文档健康检查。
+- MCP Server。
+- Git Hook。
+- 基础插件协议。
 
 P2：
 
-- MCP Server。
-- Git Hook。
 - IDE 插件。
+- 模型网关。
+- 文档健康检查。
 - 向量检索。
 - 文档漂移检测。
 
 P3：
 
+- Web/桌面客户端。
 - 团队协作。
 - 云端同步。
 - 技能市场。
 - 后台托盘进程。
 
-## 18. 里程碑
+## 19. 里程碑
 
 ### M1：CLI 可跑通
 
@@ -826,11 +845,35 @@ P3：
 - 已能搜索 Markdown 文档、知识收件箱、文档草稿和变更分析。
 - 搜索结果包含来源路径、类型、标题和片段。
 
-### M6：桌面 MVP
+### M6：MCP 集成可用
 
 交付：
 
-- Tauri 桌面端。
+- `cyclaw mcp`
+- MCP 查询项目知识。
+- MCP 暴露项目规则和搜索能力。
+
+验收：
+
+- Claude Code / Codex / Cursor 能通过 MCP 查询项目规则和历史知识。
+
+### M7：插件集成可用
+
+交付：
+
+- VS Code / Cursor 插件。
+- JetBrains 插件规划。
+- 插件展示状态、候选知识和文档草稿。
+
+验收：
+
+- 插件能调用 CLI/MCP，不复制 core 逻辑。
+
+### M8：Web/桌面客户端
+
+交付：
+
+- Tauri 或 Web 客户端。
 - 变更雷达页面。
 - 知识收件箱页面。
 - 文档 patch 页面。
@@ -839,31 +882,23 @@ P3：
 
 - 非命令行用户也能完成核心闭环。
 
-### M7：AI 工具集成
+## 20. 当前最应该先做什么
 
-交付：
-
-- `cyclaw mcp`
-- MCP 查询项目知识。
-
-验收：
-
-- Claude Code / Codex / Cursor 能通过 MCP 查询项目规则和历史知识。
-
-## 19. 当前最应该先做什么
-
-当前 M1、M2、M2.5、M3、M4 和 M5 基础版本已完成。下一步建议进入桌面知识面板：
+当前 M1、M2、M2.5、M3、M4 和 M5 基础版本已完成。下一步建议进入 MCP 集成：
 
 ```text
-创建 Tauri + React 桌面端
-启动或连接 cyClaw Agent Runtime
-展示变更雷达、知识收件箱、文档草稿和搜索结果
+实现 cyclaw mcp
+提供 search_project_knowledge
+提供 get_project_profile
+提供 list_pending_knowledge
+提供 list_document_patches
 ```
 
-仍然不要先做模型网关。
+暂时不要先做 Web/桌面客户端。
 
 原因：
 
 - 当前核心数据闭环已经跑通。
-- 下一步需要把命令行能力变成用户可用的本地 Agent 面板。
-- 桌面端是后续 IDE 插件和 MCP 集成前最直观的产品载体。
+- 下一步最重要的是让 Claude Code、Codex、Cursor 等 AI 编码工具能读取 cyClaw 的项目知识。
+- MCP/插件是 cyClaw 作为智能体能力层的关键集成方式。
+- Web/桌面客户端应该在协议和能力稳定后再做。
