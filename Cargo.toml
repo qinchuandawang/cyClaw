@@ -1,20 +1,29 @@
 [workspace]
 members = [
+  "crates/cyclaw-agent",
   "crates/cyclaw-change-radar",
   "crates/cyclaw-cli",
   "crates/cyclaw-core",
   "crates/cyclaw-docs",
+  "crates/cyclaw-events",
   "crates/cyclaw-knowledge",
+  "crates/cyclaw-memory",
+  "crates/cyclaw-mcp",
+  "crates/cyclaw-model",
+  "crates/cyclaw-policy",
   "crates/cyclaw-retrieval",
   "crates/cyclaw-scanner",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.6"
 edition = "2024"
 license = "MIT"
 authors = ["cyClaw contributors"]
+rust-version = "1.85"
+repository = "https://gitee.com/zhu-chengyuu/cy-claw"
+homepage = "https://gitee.com/zhu-chengyuu/cy-claw"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -25,3 +34,6 @@ serde_json = "1"
 serde_yaml = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+notify = "8"
+pulldown-cmark = "0.13"

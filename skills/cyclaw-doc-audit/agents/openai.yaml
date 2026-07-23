@@ -1,0 +1,4 @@
+interface:
+  display_name: "cyClaw Documentation Audit"
+  short_description: "Audit documentation drift and knowledge gaps with cyClaw"
+  default_prompt: "Use $cyclaw-doc-audit to audit documentation drift and project knowledge gaps."

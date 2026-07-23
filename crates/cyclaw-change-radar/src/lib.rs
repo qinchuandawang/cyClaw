@@ -1,10 +1,15 @@
-use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+
+const MAX_CONTENT_HASH_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeAnalysis {
@@ -75,15 +80,26 @@ pub struct ChangeSummary {
     pub architecture_changes: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitChangeSnapshot {
+    pub fingerprint: String,
+    pub files: BTreeMap<String, String>,
+}
+
 pub fn analyze_git_changes(project_root: &Path) -> Result<ChangeAnalysis> {
     ensure_git_repository(project_root)?;
 
-    let status_output = run_git(project_root, &["status", "--porcelain"])?;
+    let status_output = run_git(
+        project_root,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )?;
     let name_status_output = run_git(project_root, &["diff", "--name-status"])?;
+    let cached_name_status_output = run_git(project_root, &["diff", "--cached", "--name-status"])?;
     let branch = current_git_branch(project_root);
     let head = current_git_head(project_root);
 
     let mut changed_files = parse_name_status(&name_status_output);
+    changed_files.extend(parse_name_status(&cached_name_status_output));
     changed_files.extend(parse_untracked_from_status(&status_output));
     changed_files.sort_by(|left, right| left.path.cmp(&right.path));
     changed_files.dedup_by(|left, right| left.path == right.path);
@@ -110,12 +126,89 @@ pub fn analyze_git_changes(project_root: &Path) -> Result<ChangeAnalysis> {
 }
 
 pub fn git_change_fingerprint(project_root: &Path) -> Result<String> {
+    Ok(git_change_snapshot(project_root)?.fingerprint)
+}
+
+pub fn git_change_snapshot(project_root: &Path) -> Result<GitChangeSnapshot> {
     ensure_git_repository(project_root)?;
 
-    let status_output = run_git(project_root, &["status", "--porcelain"])?;
+    let status_output = run_git(
+        project_root,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )?;
     let name_status_output = run_git(project_root, &["diff", "--name-status"])?;
+    let cached_name_status_output = run_git(project_root, &["diff", "--cached", "--name-status"])?;
 
-    Ok(format!("{}\n{}", status_output, name_status_output))
+    let mut changed_files = parse_name_status(&name_status_output);
+    changed_files.extend(parse_name_status(&cached_name_status_output));
+    changed_files.extend(parse_untracked_from_status(&status_output));
+    changed_files.sort_by(|left, right| left.path.cmp(&right.path));
+    changed_files.dedup_by(|left, right| left.path == right.path);
+
+    let mut files = BTreeMap::new();
+    for file in changed_files {
+        let path = project_root.join(&file.path);
+        let metadata = fs::symlink_metadata(&path).ok();
+        let signature = if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            format!("{:?}:symlink", file.status)
+        } else if metadata.as_ref().is_some_and(|metadata| metadata.is_file()) {
+            let metadata = metadata.expect("文件元数据已存在");
+            if metadata.len() > MAX_CONTENT_HASH_BYTES {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                format!("{:?}:large:{}:{}", file.status, metadata.len(), modified)
+            } else {
+                let bytes = fs::read(&path)
+                    .with_context(|| format!("无法读取变更文件: {}", path.display()))?;
+                let mut hasher = DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                format!("{:?}:{:016x}", file.status, hasher.finish())
+            }
+        } else {
+            format!("{:?}:missing", file.status)
+        };
+        files.insert(file.path, signature);
+    }
+
+    let mut hasher = DefaultHasher::new();
+    files.hash(&mut hasher);
+    Ok(GitChangeSnapshot {
+        fingerprint: format!("{:016x}", hasher.finish()),
+        files,
+    })
+}
+
+pub fn changed_paths_since(
+    previous: &GitChangeSnapshot,
+    current: &GitChangeSnapshot,
+) -> BTreeSet<String> {
+    previous
+        .files
+        .keys()
+        .chain(current.files.keys())
+        .filter(|path| previous.files.get(*path) != current.files.get(*path))
+        .cloned()
+        .collect()
+}
+
+pub fn filter_change_analysis(
+    mut analysis: ChangeAnalysis,
+    changed_paths: &BTreeSet<String>,
+) -> ChangeAnalysis {
+    analysis
+        .changed_files
+        .retain(|file| changed_paths.contains(&file.path));
+    analysis.impacted_assets = build_impacted_assets(&analysis.changed_files);
+    analysis.summary = build_summary(&analysis.changed_files);
+    analysis.has_changes = !analysis.changed_files.is_empty();
+    analysis
 }
 
 pub fn classify_path(path: &str) -> Vec<ChangeType> {
@@ -515,5 +608,52 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "docs/new.md");
         assert_eq!(files[0].status, GitFileStatus::Untracked);
+    }
+
+    #[test]
+    fn snapshot_changes_when_modified_file_content_changes_again() {
+        let temp = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@cyclaw.local"],
+            vec!["config", "user.name", "cyClaw Test"],
+        ] {
+            Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .output()
+                .unwrap();
+        }
+        fs::write(temp.path().join("route.rs"), "pub fn route() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "route.rs"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+
+        fs::write(
+            temp.path().join("route.rs"),
+            "pub fn route() { println!(\"a\"); }\n",
+        )
+        .unwrap();
+        let first = git_change_snapshot(temp.path()).unwrap();
+        fs::write(
+            temp.path().join("route.rs"),
+            "pub fn route() { println!(\"b\"); }\n",
+        )
+        .unwrap();
+        let second = git_change_snapshot(temp.path()).unwrap();
+
+        assert_ne!(first.fingerprint, second.fingerprint);
+        assert_eq!(second.files.len(), 1);
+        assert_eq!(
+            changed_paths_since(&first, &second),
+            BTreeSet::from(["route.rs".to_string()])
+        );
     }
 }

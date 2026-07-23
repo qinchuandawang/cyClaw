@@ -10,7 +10,10 @@ anyhow.workspace = true
 chrono.workspace = true
 cyclaw-change-radar = { path = "../cyclaw-change-radar" }
 cyclaw-docs = { path = "../cyclaw-docs" }
+cyclaw-events = { path = "../cyclaw-events" }
 cyclaw-knowledge = { path = "../cyclaw-knowledge" }
+cyclaw-memory = { path = "../cyclaw-memory" }
+cyclaw-policy = { path = "../cyclaw-policy" }
 cyclaw-retrieval = { path = "../cyclaw-retrieval" }
 cyclaw-scanner = { path = "../cyclaw-scanner" }
 serde.workspace = true

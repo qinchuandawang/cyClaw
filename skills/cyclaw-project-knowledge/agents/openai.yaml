@@ -1,0 +1,4 @@
+interface:
+  display_name: "cyClaw Project Knowledge"
+  short_description: "Maintain project knowledge through cyClaw MCP workflows"
+  default_prompt: "Use $cyclaw-project-knowledge to inspect changes and maintain project knowledge."

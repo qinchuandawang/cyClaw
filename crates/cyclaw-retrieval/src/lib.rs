@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,21 +50,57 @@ pub fn build_index(project_root: &Path, index_path: &Path) -> Result<IndexSummar
         .with_context(|| format!("无法打开索引数据库: {}", index_path.display()))?;
     initialize_schema(&connection)?;
 
-    let transaction = connection.transaction()?;
-    transaction.execute("DELETE FROM documents", [])?;
-    transaction.execute("DELETE FROM search_index", [])?;
+    let mut existing = HashMap::new();
+    {
+        let mut statement =
+            connection.prepare("SELECT id, source_type, path, title, content FROM documents")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, source_type, path, title, content) = row?;
+            existing.insert(path, (id, source_type, title, content));
+        }
+    }
 
+    let current_paths = documents
+        .iter()
+        .map(|document| document.path.clone())
+        .collect::<HashSet<_>>();
+    let transaction = connection.transaction()?;
+    for (path, (id, _, _, _)) in &existing {
+        if !current_paths.contains(path) {
+            transaction.execute("DELETE FROM search_index WHERE rowid = ?1", params![id])?;
+            transaction.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
+        }
+    }
     let indexed_at = Utc::now().to_rfc3339();
     for document in &documents {
+        let source_type = source_type_name(&document.source_type);
+        let unchanged = existing
+            .get(&document.path)
+            .map(|(_, old_type, old_title, old_content)| {
+                old_type == source_type
+                    && old_title == &document.title
+                    && old_content == &document.content
+            })
+            .unwrap_or(false);
+        if unchanged {
+            continue;
+        }
+        if let Some((id, _, _, _)) = existing.get(&document.path) {
+            transaction.execute("DELETE FROM search_index WHERE rowid = ?1", params![id])?;
+            transaction.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
+        }
         transaction.execute(
             "INSERT INTO documents (source_type, path, title, content, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                source_type_name(&document.source_type),
-                document.path,
-                document.title,
-                document.content,
-                indexed_at
-            ],
+            params![source_type, document.path, document.title, document.content, indexed_at],
         )?;
         let rowid = transaction.last_insert_rowid();
         transaction.execute(
@@ -395,5 +432,31 @@ mod tests {
         assert_eq!(summary.document_count, 1);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "docs/api.md");
+    }
+
+    #[test]
+    fn incremental_index_updates_and_removes_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let docs = temp.path().join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        let first = docs.join("first.md");
+        let second = docs.join("second.md");
+        fs::write(&first, "# First\nalpha").unwrap();
+        fs::write(&second, "# Second\nbeta").unwrap();
+        let index_path = temp.path().join(".cyclaw").join("index.sqlite");
+
+        assert_eq!(
+            build_index(temp.path(), &index_path)
+                .unwrap()
+                .document_count,
+            2
+        );
+        fs::write(&first, "# First\ngamma").unwrap();
+        fs::remove_file(&second).unwrap();
+        let summary = build_index(temp.path(), &index_path).unwrap();
+
+        assert_eq!(summary.document_count, 1);
+        assert_eq!(search_index(&index_path, "gamma", 10).unwrap().len(), 1);
+        assert!(search_index(&index_path, "beta", 10).unwrap().is_empty());
     }
 }

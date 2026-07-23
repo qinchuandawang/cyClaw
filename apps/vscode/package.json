@@ -1,0 +1,323 @@
+{
+  "name": "cyclaw-vscode",
+  "displayName": "cyClaw",
+  "description": "Coding Agent 的项目记忆、事实治理与上下文控制层。",
+  "version": "0.1.6",
+  "publisher": "cyclaw",
+  "license": "MIT",
+  "homepage": "https://gitee.com/zhu-chengyuu/cy-claw",
+  "repository": {
+    "type": "git",
+    "url": "https://gitee.com/zhu-chengyuu/cy-claw.git"
+  },
+  "bugs": {
+    "url": "https://gitee.com/zhu-chengyuu/cy-claw/issues"
+  },
+  "preview": true,
+  "keywords": [
+    "coding-agent",
+    "mcp",
+    "project-memory",
+    "knowledge-management",
+    "codex"
+  ],
+  "files": [
+    "dist",
+    "resources",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:cyclaw.dashboardView",
+    "onView:cyclaw.knowledgeView",
+    "onCommand:cyclaw.refresh",
+    "onCommand:cyclaw.init",
+    "onCommand:cyclaw.scan",
+    "onCommand:cyclaw.watchOnce",
+    "onCommand:cyclaw.startWatch",
+    "onCommand:cyclaw.stopWatch",
+    "onCommand:cyclaw.acceptCandidate",
+    "onCommand:cyclaw.acceptAndDraft",
+    "onCommand:cyclaw.ignoreCandidate",
+    "onCommand:cyclaw.applyPatch",
+    "onCommand:cyclaw.openCandidate",
+    "onCommand:cyclaw.openPatch",
+    "onCommand:cyclaw.configureModel",
+    "onCommand:cyclaw.switchModel",
+    "onCommand:cyclaw.configurePermissions",
+    "onCommand:cyclaw.configureMode",
+    "onCommand:cyclaw.batchCandidates",
+    "onCommand:cyclaw.showOutput",
+    "onCommand:cyclaw.togglePermission",
+    "onCommand:cyclaw.runAgent",
+    "onCommand:cyclaw.beginTask",
+    "onCommand:cyclaw.closeTask",
+    "onCommand:cyclaw.recordDecision",
+    "onCommand:cyclaw.reconcileKnowledge"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "cyClaw",
+      "properties": {
+        "cyclaw.command": {
+          "type": "string",
+          "default": "",
+          "description": "可选的 cyClaw CLI 可执行文件路径。留空时优先使用 VSIX 内置 CLI。"
+        },
+        "cyclaw.useCargoRun": {
+          "type": "boolean",
+          "default": false,
+          "description": "仅开发 cyClaw 本身时启用，使用 cargo run -p cyclaw-cli -- 调用源码 CLI。"
+        },
+        "cyclaw.autoInitialize": {
+          "type": "boolean",
+          "default": true,
+          "description": "首次打开项目时自动初始化并扫描 cyClaw 知识目录。"
+        },
+        "cyclaw.autoWatch": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开工作区后自动启动 cyClaw Watch。"
+        },
+        "cyclaw.watchIntervalSeconds": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "description": "旧版轮询配置，保留用于兼容，事件驱动 Watch 不再使用。",
+          "deprecationMessage": "请改用 cyclaw.watchDebounceMilliseconds。"
+        },
+        "cyclaw.watchDebounceMilliseconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 100,
+          "maximum": 10000,
+          "description": "文件系统事件合并窗口，避免一次保存产生多次分析。"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "cyclaw.refresh",
+        "title": "刷新 cyClaw 知识状态",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.init",
+        "title": "初始化 cyClaw",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.scan",
+        "title": "扫描项目画像",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.watchOnce",
+        "title": "检查一次项目变更",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.startWatch",
+        "title": "启动 cyClaw Watch",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.stopWatch",
+        "title": "停止 cyClaw Watch",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.acceptCandidate",
+        "title": "接受候选知识",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.acceptAndDraft",
+        "title": "接受并生成文档草稿",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.ignoreCandidate",
+        "title": "忽略候选知识",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.applyPatch",
+        "title": "应用文档草稿",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.openCandidate",
+        "title": "查看候选详情",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.openPatch",
+        "title": "查看文档 Diff",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.configureModel",
+        "title": "配置模型 Provider",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.switchModel",
+        "title": "切换活动模型",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.configurePermissions",
+        "title": "管理高级权限",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.configureMode",
+        "title": "选择运行策略",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.batchCandidates",
+        "title": "批量处理知识候选",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.showOutput",
+        "title": "查看运行日志",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.togglePermission",
+        "title": "切换权限",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.runAgent",
+        "title": "运行一次 cyClaw Agent",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.beginTask",
+        "title": "开始项目记忆任务",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.closeTask",
+        "title": "关闭任务并执行知识对账",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.recordDecision",
+        "title": "记录项目关键决策",
+        "category": "cyClaw"
+      },
+      {
+        "command": "cyclaw.reconcileKnowledge",
+        "title": "执行项目知识对账",
+        "category": "cyClaw"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cyclaw",
+          "title": "cyClaw",
+          "icon": "resources/cyclaw.svg"
+        }
+      ]
+    },
+    "views": {
+      "cyclaw": [
+        {
+          "id": "cyclaw.dashboardView",
+          "name": "cyClaw 概览",
+          "type": "webview"
+        },
+        {
+          "id": "cyclaw.knowledgeView",
+          "name": "知识与权限"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "cyclaw.refresh",
+          "when": "view == cyclaw.knowledgeView",
+          "group": "navigation"
+        },
+        {
+          "command": "cyclaw.startWatch",
+          "when": "view == cyclaw.knowledgeView",
+          "group": "navigation"
+        },
+        {
+          "command": "cyclaw.stopWatch",
+          "when": "view == cyclaw.knowledgeView",
+          "group": "navigation"
+        },
+        {
+          "command": "cyclaw.configureModel",
+          "when": "view == cyclaw.knowledgeView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "cyclaw.configurePermissions",
+          "when": "view == cyclaw.knowledgeView",
+          "group": "navigation@4"
+        },
+        {
+          "command": "cyclaw.runAgent",
+          "when": "view == cyclaw.knowledgeView",
+          "group": "navigation@5"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "cyclaw.acceptAndDraft",
+          "when": "view == cyclaw.knowledgeView && viewItem == cyclawCandidate",
+          "group": "inline@1"
+        },
+        {
+          "command": "cyclaw.acceptCandidate",
+          "when": "view == cyclaw.knowledgeView && viewItem == cyclawCandidate",
+          "group": "navigation@1"
+        },
+        {
+          "command": "cyclaw.ignoreCandidate",
+          "when": "view == cyclaw.knowledgeView && viewItem == cyclawCandidate",
+          "group": "inline@2"
+        },
+        {
+          "command": "cyclaw.applyPatch",
+          "when": "view == cyclaw.knowledgeView && viewItem == cyclawPatch",
+          "group": "inline@1"
+        },
+        {
+          "command": "cyclaw.togglePermission",
+          "when": "view == cyclaw.knowledgeView && viewItem == cyclawPermission",
+          "group": "inline@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "check": "tsc --noEmit -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "1.92.0",
+    "typescript": "^5.7.0"
+  }
+}

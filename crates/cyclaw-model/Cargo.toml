@@ -1,0 +1,18 @@
+[package]
+name = "cyclaw-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+cyclaw-policy = { path = "../cyclaw-policy" }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -15,9 +17,21 @@ pub struct KnowledgeCandidate {
     pub reasons: Vec<String>,
     pub recommended_doc: String,
     pub related_files: Vec<String>,
+    #[serde(default = "default_confidence")]
+    pub confidence: u8,
+    #[serde(default)]
+    pub reviewed_by_model: bool,
+    #[serde(default)]
+    pub model_recommendation: Option<String>,
+    #[serde(default)]
+    pub model_rationale: Option<String>,
     pub status: KnowledgeStatus,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_confidence() -> u8 {
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +99,7 @@ fn candidate_from_asset(
     let now = Utc::now().to_rfc3339();
     let related_change_types = related_change_types(analysis, &asset.related_files);
     let importance = score_importance(&related_change_types, asset);
+    let confidence = confidence_for_importance(&importance);
 
     KnowledgeCandidate {
         id: candidate_id(analysis, asset, index),
@@ -95,9 +110,21 @@ fn candidate_from_asset(
         reasons: reasons_for_asset(asset, &related_change_types),
         recommended_doc: asset.asset.clone(),
         related_files: asset.related_files.clone(),
+        confidence,
+        reviewed_by_model: false,
+        model_recommendation: None,
+        model_rationale: None,
         status: KnowledgeStatus::Pending,
         created_at: now.clone(),
         updated_at: now,
+    }
+}
+
+fn confidence_for_importance(importance: &KnowledgeImportance) -> u8 {
+    match importance {
+        KnowledgeImportance::High => 90,
+        KnowledgeImportance::Medium => 75,
+        KnowledgeImportance::Low => 55,
     }
 }
 
@@ -108,8 +135,19 @@ fn candidate_id(analysis: &ChangeAnalysis, asset: &ImpactedAsset, index: usize) 
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
+    let mut hasher = DefaultHasher::new();
+    asset.asset.hash(&mut hasher);
+    asset.reason.hash(&mut hasher);
+    asset.related_files.hash(&mut hasher);
+    let change_digest = hasher.finish();
 
-    format!("kc_{}_{}_{}", head, normalized_asset, index + 1)
+    format!(
+        "kc_{}_{}_{:016x}_{}",
+        head,
+        normalized_asset,
+        change_digest,
+        index + 1
+    )
 }
 
 fn summary_for_asset(asset: &ImpactedAsset) -> String {
@@ -225,5 +263,15 @@ mod tests {
         assert_eq!(candidates[0].recommended_doc, "docs/dependencies.md");
         assert_eq!(candidates[0].importance, KnowledgeImportance::Medium);
         assert_eq!(candidates[0].status, KnowledgeStatus::Pending);
+        assert_eq!(candidates[0].confidence, 75);
+    }
+
+    #[test]
+    fn reads_legacy_candidate_without_review_fields() {
+        let json = r#"{"id":"legacy","summary":"旧候选","source_type":"manual","source_ref":"manual","importance":"low","reasons":[],"recommended_doc":"docs/changelog.md","related_files":[],"status":"pending","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
+        let candidates = parse_jsonl(json).unwrap();
+
+        assert_eq!(candidates[0].confidence, 50);
+        assert!(!candidates[0].reviewed_by_model);
     }
 }

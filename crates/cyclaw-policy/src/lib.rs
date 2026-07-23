@@ -1,0 +1,493 @@
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+const CYCLE_DIR: &str = ".cyclaw";
+const CONFIG_FILE: &str = "config.yaml";
+const LOCK_DIR: &str = "locks";
+
+/// 项目级进程锁，使用独占文件避免 watch、Agent 和插件同时覆盖同一份产物。
+pub struct ProjectLock {
+    path: PathBuf,
+}
+
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub fn acquire_lock(project_root: &Path, name: &str, timeout: Duration) -> Result<ProjectLock> {
+    let lock_dir = project_root.join(CYCLE_DIR).join(LOCK_DIR);
+    fs::create_dir_all(&lock_dir)
+        .with_context(|| format!("无法创建锁目录: {}", lock_dir.display()))?;
+    let path = lock_dir.join(format!("{}.lock", sanitize_lock_name(name)));
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(ProjectLock { path }),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("获取项目锁超时: {}", path.display());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("无法创建项目锁: {}", path.display()));
+            }
+        }
+    }
+}
+
+fn sanitize_lock_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionLevel {
+    ReadOnly,
+    LocalKnowledgeWrite,
+    DocsWrite,
+    ModelCall,
+    Automation,
+    Shell,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyConfig {
+    pub schema_version: u32,
+    pub permissions: PermissionConfig,
+    pub model_policy: ModelPolicy,
+    pub automation: AutomationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionConfig {
+    pub default_level: PermissionLevel,
+    pub read_scope: Vec<String>,
+    pub write_scopes: Vec<String>,
+    pub denied_paths: Vec<String>,
+    pub allow_model_call: bool,
+    pub allow_network: bool,
+    pub allow_shell: bool,
+    pub allow_code_write: bool,
+    pub allow_docs_apply: bool,
+    pub allow_auto_apply_docs: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelPolicy {
+    pub max_context_chars: usize,
+    pub allow_source_snippets: bool,
+    pub allow_config_snippets: bool,
+    pub redact_secrets: bool,
+    pub max_concurrent_calls: usize,
+    pub request_timeout_seconds: u64,
+    pub max_retries: usize,
+    pub min_interval_millis: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutomationPolicy {
+    pub auto_watch: bool,
+    pub auto_generate_inbox: bool,
+    pub auto_generate_draft: bool,
+    pub auto_apply_docs: bool,
+    pub auto_apply_min_confidence: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyCheck {
+    pub allowed: bool,
+    pub reason: String,
+    pub normalized_path: String,
+}
+
+pub fn policy_path(project_root: &Path) -> PathBuf {
+    project_root.join(CYCLE_DIR).join(CONFIG_FILE)
+}
+
+pub fn load_or_default(project_root: &Path) -> Result<PolicyConfig> {
+    let path = policy_path(project_root);
+    if !path.exists() {
+        return Ok(default_policy());
+    }
+
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("无法读取配置文件: {}", path.display()))?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    Ok(policy_from_yaml(value))
+}
+
+pub fn set_permission(project_root: &Path, key: &str, enabled: bool) -> Result<PolicyConfig> {
+    let _lock = acquire_lock(project_root, "policy", Duration::from_secs(5))?;
+    let path = policy_path(project_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut value = if path.exists() {
+        serde_yaml::from_str::<serde_yaml::Value>(&fs::read_to_string(&path)?)?
+    } else {
+        serde_yaml::to_value(default_policy())?
+    };
+    let mapping = value
+        .as_mapping_mut()
+        .with_context(|| "cyClaw 配置不是 YAML 对象")?;
+    let permissions_key = serde_yaml::Value::String("permissions".to_string());
+    let permissions = mapping
+        .entry(permissions_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
+        .as_mapping_mut()
+        .with_context(|| "permissions 不是 YAML 对象")?;
+    let allowed = [
+        "allow_model_call",
+        "allow_network",
+        "allow_shell",
+        "allow_code_write",
+        "allow_docs_apply",
+        "allow_auto_apply_docs",
+    ];
+    if !allowed.contains(&key) {
+        anyhow::bail!("不支持的权限开关: {}", key);
+    }
+    permissions.insert(
+        serde_yaml::Value::String(key.to_string()),
+        serde_yaml::Value::Bool(enabled),
+    );
+    fs::write(&path, serde_yaml::to_string(&value)?)?;
+    load_or_default(project_root)
+}
+
+pub fn set_auto_apply_min_confidence(project_root: &Path, confidence: u8) -> Result<PolicyConfig> {
+    let _lock = acquire_lock(project_root, "policy", Duration::from_secs(5))?;
+    let path = policy_path(project_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut value = if path.exists() {
+        serde_yaml::from_str::<serde_yaml::Value>(&fs::read_to_string(&path)?)?
+    } else {
+        serde_yaml::to_value(default_policy())?
+    };
+    let mapping = value
+        .as_mapping_mut()
+        .context("cyClaw 配置不是 YAML 对象")?;
+    let automation = mapping
+        .entry(serde_yaml::Value::String("automation".to_string()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
+        .as_mapping_mut()
+        .context("automation 不是 YAML 对象")?;
+    automation.insert(
+        serde_yaml::Value::String("auto_apply_min_confidence".to_string()),
+        serde_yaml::Value::Number(confidence.min(100).into()),
+    );
+    fs::write(&path, serde_yaml::to_string(&value)?)?;
+    load_or_default(project_root)
+}
+
+pub fn check_write_path(
+    project_root: &Path,
+    target: &str,
+    level: PermissionLevel,
+) -> Result<PolicyCheck> {
+    let policy = load_or_default(project_root)?;
+    Ok(check_write_path_with_policy(&policy, target, level))
+}
+
+pub fn check_model_call(project_root: &Path, level: PermissionLevel) -> Result<PolicyCheck> {
+    let policy = load_or_default(project_root)?;
+    let allowed = level >= PermissionLevel::ModelCall && policy.permissions.allow_model_call;
+    Ok(PolicyCheck {
+        allowed,
+        reason: if allowed {
+            "允许模型调用".to_string()
+        } else {
+            "模型调用未授权".to_string()
+        },
+        normalized_path: "model_call".to_string(),
+    })
+}
+
+pub fn check_write_path_with_policy(
+    policy: &PolicyConfig,
+    target: &str,
+    level: PermissionLevel,
+) -> PolicyCheck {
+    let normalized = normalize_path(target);
+
+    if normalized.contains("..") {
+        return denied(normalized, "路径包含 ..");
+    }
+
+    if is_denied_path(policy, &normalized) {
+        return denied(normalized, "路径命中 denied_paths");
+    }
+
+    if normalized.starts_with("docs/") && level < PermissionLevel::DocsWrite {
+        return denied(normalized, "写 docs 需要 DocsWrite 权限");
+    }
+
+    let allowed = policy
+        .permissions
+        .write_scopes
+        .iter()
+        .any(|scope| path_in_scope(&normalized, scope));
+
+    if allowed {
+        PolicyCheck {
+            allowed: true,
+            reason: "路径在允许写入范围内".to_string(),
+            normalized_path: normalized,
+        }
+    } else {
+        denied(normalized, "路径不在允许写入范围内")
+    }
+}
+
+pub fn default_policy() -> PolicyConfig {
+    PolicyConfig {
+        schema_version: 1,
+        permissions: PermissionConfig {
+            default_level: PermissionLevel::LocalKnowledgeWrite,
+            read_scope: vec![".".to_string()],
+            write_scopes: vec![".cyclaw".to_string(), "docs".to_string()],
+            denied_paths: vec![
+                ".env".to_string(),
+                ".env.*".to_string(),
+                "**/*.pem".to_string(),
+                "**/*.key".to_string(),
+                "**/id_rsa".to_string(),
+                ".git".to_string(),
+                "node_modules".to_string(),
+                "target".to_string(),
+            ],
+            allow_model_call: false,
+            allow_network: false,
+            allow_shell: false,
+            allow_code_write: false,
+            allow_docs_apply: false,
+            allow_auto_apply_docs: false,
+        },
+        model_policy: ModelPolicy {
+            max_context_chars: 30000,
+            allow_source_snippets: false,
+            allow_config_snippets: true,
+            redact_secrets: true,
+            max_concurrent_calls: 1,
+            request_timeout_seconds: 30,
+            max_retries: 2,
+            min_interval_millis: 100,
+        },
+        automation: AutomationPolicy {
+            auto_watch: true,
+            auto_generate_inbox: true,
+            auto_generate_draft: false,
+            auto_apply_docs: false,
+            auto_apply_min_confidence: 90,
+        },
+    }
+}
+
+fn policy_from_yaml(value: serde_yaml::Value) -> PolicyConfig {
+    let mut policy = default_policy();
+    if let Some(permissions) = value.get("permissions") {
+        if let Some(write_scopes) = permissions
+            .get("write_scopes")
+            .and_then(|value| value.as_sequence())
+        {
+            policy.permissions.write_scopes = write_scopes
+                .iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect();
+        }
+        if let Some(allow_model_call) = permissions
+            .get("allow_model_call")
+            .and_then(|value| value.as_bool())
+        {
+            policy.permissions.allow_model_call = allow_model_call;
+        }
+        if let Some(allow_network) = permissions
+            .get("allow_network")
+            .and_then(|value| value.as_bool())
+        {
+            policy.permissions.allow_network = allow_network;
+        }
+        if let Some(allow_shell) = permissions
+            .get("allow_shell")
+            .and_then(|value| value.as_bool())
+        {
+            policy.permissions.allow_shell = allow_shell;
+        }
+        if let Some(allow_code_write) = permissions
+            .get("allow_code_write")
+            .and_then(|value| value.as_bool())
+        {
+            policy.permissions.allow_code_write = allow_code_write;
+        }
+        if let Some(allow_docs_apply) = permissions
+            .get("allow_docs_apply")
+            .and_then(|value| value.as_bool())
+        {
+            policy.permissions.allow_docs_apply = allow_docs_apply;
+        }
+        if let Some(allow_auto_apply_docs) = permissions
+            .get("allow_auto_apply_docs")
+            .and_then(|value| value.as_bool())
+        {
+            policy.permissions.allow_auto_apply_docs = allow_auto_apply_docs;
+        }
+    }
+    if let Some(model_policy) = value.get("model_policy") {
+        if let Some(value) = model_policy
+            .get("max_context_chars")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.max_context_chars = value as usize;
+        }
+        if let Some(value) = model_policy
+            .get("allow_source_snippets")
+            .and_then(|value| value.as_bool())
+        {
+            policy.model_policy.allow_source_snippets = value;
+        }
+        if let Some(value) = model_policy
+            .get("allow_config_snippets")
+            .and_then(|value| value.as_bool())
+        {
+            policy.model_policy.allow_config_snippets = value;
+        }
+        if let Some(value) = model_policy
+            .get("redact_secrets")
+            .and_then(|value| value.as_bool())
+        {
+            policy.model_policy.redact_secrets = value;
+        }
+        if let Some(value) = model_policy
+            .get("max_concurrent_calls")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.max_concurrent_calls = value.max(1) as usize;
+        }
+        if let Some(value) = model_policy
+            .get("request_timeout_seconds")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.request_timeout_seconds = value.max(1);
+        }
+        if let Some(value) = model_policy
+            .get("max_retries")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.max_retries = value as usize;
+        }
+        if let Some(value) = model_policy
+            .get("min_interval_millis")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.min_interval_millis = value;
+        }
+    }
+    if let Some(automation) = value.get("automation")
+        && let Some(value) = automation
+            .get("auto_apply_min_confidence")
+            .and_then(|value| value.as_u64())
+    {
+        policy.automation.auto_apply_min_confidence = value.min(100) as u8;
+    }
+    policy
+}
+
+fn is_denied_path(policy: &PolicyConfig, normalized: &str) -> bool {
+    policy.permissions.denied_paths.iter().any(|pattern| {
+        normalized == pattern
+            || normalized.starts_with(&format!("{}/", pattern.trim_end_matches('/')))
+            || (pattern.starts_with("**/*.")
+                && normalized.ends_with(pattern.trim_start_matches("**/*")))
+            || (pattern.ends_with(".*") && normalized.starts_with(pattern.trim_end_matches(".*")))
+    })
+}
+
+fn path_in_scope(path: &str, scope: &str) -> bool {
+    let normalized_scope = normalize_path(scope).trim_end_matches('/').to_string();
+    path == normalized_scope || path.starts_with(&format!("{}/", normalized_scope))
+}
+
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+fn denied(normalized_path: String, reason: &str) -> PolicyCheck {
+    PolicyCheck {
+        allowed: false,
+        reason: reason.to_string(),
+        normalized_path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_allows_cyclaw_writes() {
+        let policy = default_policy();
+        let result = check_write_path_with_policy(
+            &policy,
+            ".cyclaw/agent-runs/run.json",
+            PermissionLevel::LocalKnowledgeWrite,
+        );
+
+        assert!(result.allowed);
+    }
+
+    #[test]
+    fn docs_write_requires_docs_level() {
+        let policy = default_policy();
+        let result = check_write_path_with_policy(
+            &policy,
+            "docs/api.md",
+            PermissionLevel::LocalKnowledgeWrite,
+        );
+
+        assert!(!result.allowed);
+    }
+
+    #[test]
+    fn denied_paths_are_blocked() {
+        let policy = default_policy();
+        let result = check_write_path_with_policy(&policy, ".env", PermissionLevel::DocsWrite);
+
+        assert!(!result.allowed);
+    }
+
+    #[test]
+    fn persists_auto_apply_confidence_threshold() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = set_auto_apply_min_confidence(temp.path(), 86).unwrap();
+
+        assert_eq!(policy.automation.auto_apply_min_confidence, 86);
+        assert_eq!(
+            load_or_default(temp.path())
+                .unwrap()
+                .automation
+                .auto_apply_min_confidence,
+            86
+        );
+    }
+}

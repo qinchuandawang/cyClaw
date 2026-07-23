@@ -272,15 +272,14 @@ Agent Runtime 自动监听项目变化
 
 ### 8.3 第一版实现策略
 
-第一版使用 Git 状态轮询：
+当前版本使用事件驱动监听与 Git 快照校验：
 
 ```text
-定期读取 git status / git diff -> 计算 fingerprint -> 变化后触发 diff 分析
+文件系统事件 -> 合并短时间内的重复事件 -> Git 内容快照去重 -> 增量 diff 分析
 ```
 
-后续再升级为：
+后续可继续补充：
 
-- 文件系统事件监听。
 - Git Hook。
 - IDE 文件保存事件。
 - 后台托盘进程。
@@ -292,7 +291,7 @@ Agent Runtime 自动监听项目变化
 - 没有变更时不重复生成分析。
 - 能通过 `--once` 做测试和调试。
 
-当前状态：已完成最小版本。
+当前状态：已完成事件驱动版本。
 
 实现补充：
 
@@ -462,6 +461,8 @@ search_index
 
 ## 12. 阶段 7：MCP 与外部集成
 
+状态：已完成第一版基础集成。
+
 ### 12.1 目标
 
 让 Codex、Claude Code、Cursor 等工具可以调用 cyClaw 查询项目记忆。
@@ -473,11 +474,12 @@ search_index
    - `get_project_profile`
    - `search_project_knowledge`
    - `list_pending_knowledge`
-   - `suggest_doc_updates`
-   - `get_project_rules`
+   - `list_document_patches`
+   - `get_project_status`
 3. 提供 MCP resources：
    - `.cyclaw/project.md`
-   - `.cyclaw/memory.md`
+   - `.cyclaw/knowledge-inbox.jsonl`
+   - `.cyclaw/doc-patches/*.json`
    - `docs/*`
 4. 编写 Claude Code / Codex 接入说明。
 
@@ -488,7 +490,19 @@ search_index
 - 查询结果包含来源。
 - 不允许外部工具直接绕过确认写入文档。
 
+当前实现说明：
+
+- 已新增 `cyclaw-mcp` crate。
+- 已支持 `cyclaw mcp --path <project>` 启动 MCP stdio 服务。
+- 已支持 `initialize`、`tools/list`、`tools/call`、`resources/list`、`resources/read`。
+- 已提供 `get_project_status`、`get_project_profile`、`search_project_knowledge`、`list_pending_knowledge`、`list_document_patches`。
+- 工具输出以 JSON 文本返回，并带 `source_path` 或搜索结果来源路径。
+- MCP resources 只允许读取 `.cyclaw/project.md`、`.cyclaw/knowledge-inbox.jsonl`、`.cyclaw/doc-patches/` 和 `docs/`。
+- 当前 MCP 不提供绕过用户确认的写文档工具。
+
 ## 13. 阶段 8：插件集成
+
+状态：已完成第一版 VS Code / Cursor 插件骨架，并新增 IntelliJ IDEA 插件工程。
 
 ### 13.1 目标
 
@@ -501,9 +515,10 @@ search_index
    - 展示 `cyclaw status`。
    - 展示 pending 知识和文档草稿。
    - 调用 accept / ignore / apply。
-2. JetBrains 插件规划：
-   - 先形成协议和命令约定。
-   - 后续再实现 IntelliJ IDEA / RustRover 插件。
+2. JetBrains 插件：
+   - 提供 IntelliJ IDEA Tool Window。
+   - 展示 `cyclaw status`、pending 知识和文档草稿。
+   - 调用 accept / ignore / apply。
 3. 插件不复制 core 逻辑，只调用 CLI/MCP。
 
 ### 13.3 验收标准
@@ -511,6 +526,22 @@ search_index
 - 插件能在当前项目里读取 cyClaw 状态。
 - 插件能展示知识收件箱和文档草稿。
 - 插件能触发用户确认动作。
+
+当前实现说明：
+
+- 已新增 `apps/vscode` 插件工程。
+- 插件通过 `cyclaw mcp` 读取 `get_project_status`、`list_pending_knowledge`、`list_document_patches`。
+- 插件通过 CLI 命令执行 `cyclaw init`、`cyclaw scan`、`cyclaw watch --once`。
+- 插件支持启动和停止 `cyclaw watch` 常驻进程。
+- 插件支持对候选知识执行 accept / ignore。
+- 插件支持对文档草稿执行 apply。
+- 当前 UI 使用 VS Code Tree View，不引入 Webview，保持第一版轻量。
+- 写入类操作仍然通过 CLI 显式命令触发，不放入 MCP 默认只读工具。
+- 已新增 `apps/idea` IntelliJ IDEA 插件工程。
+- IDEA 插件提供 `cyClaw` Tool Window。
+- IDEA 插件通过 `cyclaw mcp` 读取项目状态、候选知识和文档草稿。
+- IDEA 插件通过 CLI 执行 init / scan / watch / accept / ignore / apply。
+- IDEA 插件当前目标 IntelliJ IDEA Community 2023.3.8 和 Java 17。
 
 ## 14. 阶段 9：产品打磨与发布
 
@@ -847,6 +878,8 @@ P3：
 
 ### M6：MCP 集成可用
 
+状态：已完成第一版基础集成。
+
 交付：
 
 - `cyclaw mcp`
@@ -857,17 +890,52 @@ P3：
 
 - Claude Code / Codex / Cursor 能通过 MCP 查询项目规则和历史知识。
 
+当前实现说明：
+
+- `cyclaw mcp` 已能通过 stdio 处理 MCP framed message。
+- 已有单元测试覆盖 initialize、tools/list 和非法资源路径拒绝。
+- `scripts/smoke-cli.ps1` 已加入 MCP initialize smoke 验证。
+
 ### M7：插件集成可用
+
+状态：已完成第一版 VS Code / Cursor 插件骨架，并新增 IntelliJ IDEA 插件工程。
 
 交付：
 
 - VS Code / Cursor 插件。
-- JetBrains 插件规划。
+- IntelliJ IDEA 插件工程。
 - 插件展示状态、候选知识和文档草稿。
 
 验收：
 
 - 插件能调用 CLI/MCP，不复制 core 逻辑。
+
+当前实现说明：
+
+- `apps/vscode` 已能通过 `pnpm run check` 和 `pnpm run compile`。
+- 插件默认开发模式使用 `cargo run -p cyclaw-cli -- ...` 调用当前 Rust CLI。
+- 发布安装后可将 `cyclaw.useCargoRun` 设为 `false`，并通过 `cyclaw.command` 指向已安装的 `cyclaw` 二进制。
+- 插件已具备查看、监听、接受、忽略、应用的最小闭环。
+- `apps/idea` 已具备标准 IntelliJ Platform 插件结构：`build.gradle.kts`、`settings.gradle.kts`、`plugin.xml`、ToolWindow、Project Service、Gradle Wrapper 脚本。
+- 已补齐 `gradle-wrapper.jar`，并通过 `apps/idea\gradlew.bat buildPlugin` 验证，产物为 `apps/idea/build/distributions/cyclaw-idea-0.1.0.zip`。
+- 已新增 `scripts/verify-plugins.ps1`，用于验证 VS Code / Cursor 插件，并在 Gradle 可用时验证 IDEA 插件。
+- 已增强 `scripts/smoke-cli.ps1`，覆盖 CLI 主链路、MCP tools/resources、候选知识接受和文档草稿应用。
+- 已新增 `scripts/verify-codex-mcp.ps1`，验证 Codex CLI 能接受 cyClaw 的 stdio MCP 配置，并验证 MCP tools/resources 响应。
+- 已新增 `cyclaw-model` crate，提供 OpenAI-compatible 模型 Provider 配置和连通性测试。
+- 已新增 `cyclaw model add/list/test`。
+- 已验证 DeepSeek Provider：`https://api.deepseek.com` + `deepseek-v4-flash`。
+- API Key 只通过环境变量读取，不写入项目文件。
+- 模型思考模式默认关闭，只有显式传入 `--thinking` 才开启。
+- 已新增 `scripts/verify-model-provider.ps1`，用于验证用户自带模型 Provider。
+- 已新增 `cyclaw-agent` crate，提供最小 Agent Runtime。
+- 已新增 `cyclaw agent run --once`，支持本地编排和可选模型建议。
+- Agent 运行记录写入 `.cyclaw/agent-runs/{run-id}.json`。
+- 已新增 `cyclaw-policy` crate，提供权限配置、路径写入检查和模型调用检查。
+- 已新增 `cyclaw-events` crate，提供 `.cyclaw/events.jsonl` 事件日志。
+- 已新增 `cyclaw policy show/check` 和 `cyclaw events list`。
+- `cyclaw draft apply` 已接入 DocsWrite 权限检查。
+- `cyclaw model test` 已接入 ModelCall 权限检查。
+- Agent 模型调用成功后会写入 `model_called` 事件。
 
 ### M8：Web/桌面客户端
 
@@ -884,14 +952,13 @@ P3：
 
 ## 20. 当前最应该先做什么
 
-当前 M1、M2、M2.5、M3、M4 和 M5 基础版本已完成。下一步建议进入 MCP 集成：
+当前 M1、M2、M2.5、M3、M4、M5、M6 和 M7 基础版本已完成。下一步建议完成 IDEA 插件构建验证和插件可用性打磨：
 
 ```text
-实现 cyclaw mcp
-提供 search_project_knowledge
-提供 get_project_profile
-提供 list_pending_knowledge
-提供 list_document_patches
+补齐或生成 apps/idea/gradle/wrapper/gradle-wrapper.jar
+运行 apps/idea 的 buildPlugin / runIde
+补充插件调试配置与打包说明
+补充插件端错误提示和状态栏
 ```
 
 暂时不要先做 Web/桌面客户端。
@@ -899,6 +966,6 @@ P3：
 原因：
 
 - 当前核心数据闭环已经跑通。
-- 下一步最重要的是让 Claude Code、Codex、Cursor 等 AI 编码工具能读取 cyClaw 的项目知识。
-- MCP/插件是 cyClaw 作为智能体能力层的关键集成方式。
+- MCP 基础层和 VS Code / Cursor 插件骨架已经完成。
+- 下一步应把用户确认动作接进插件，让 cyClaw 的日常使用尽量不依赖手敲 CLI。
 - Web/桌面客户端应该在协议和能力稳定后再做。

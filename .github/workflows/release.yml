@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要发布的版本标签，例如 v0.1.6
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  cli:
+    name: CLI (${{ matrix.asset_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: windows-x64
+            extension: .exe
+          - os: ubuntu-latest
+            asset_name: linux-x64
+            extension: ""
+          - os: macos-13
+            asset_name: macos-x64
+            extension: ""
+          - os: macos-14
+            asset_name: macos-arm64
+            extension: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: 构建 CLI
+        run: cargo build --release -p cyclaw-cli
+      - name: 准备发布文件
+        shell: pwsh
+        env:
+          ASSET_NAME: ${{ matrix.asset_name }}
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $source = if ($env:RUNNER_OS -eq 'Windows') { 'target/release/cyclaw.exe' } else { 'target/release/cyclaw' }
+          Copy-Item $source "release/cyclaw-$env:ASSET_NAME$env:EXTENSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyclaw-cli-${{ matrix.asset_name }}
+          path: release/*
+          if-no-files-found: error
+
+  vscode:
+    name: VS Code VSIX (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/vscode/pnpm-lock.yaml
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - name: 打包 VSIX
+        shell: pwsh
+        run: ./scripts/package-vscode.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyclaw-vscode-windows-x64
+          path: apps/vscode/*.vsix
+          if-no-files-found: error
+
+  idea:
+    name: IntelliJ IDEA plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: 打包插件
+        working-directory: apps/idea
+        run: ./gradlew buildPlugin --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyclaw-idea-plugin
+          path: apps/idea/build/distributions/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [cli, vscode, idea]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release/assets
+          merge-multiple: true
+      - name: 生成校验值
+        working-directory: release/assets
+        run: sha256sum * > SHA256SUMS.txt
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: release/assets/*

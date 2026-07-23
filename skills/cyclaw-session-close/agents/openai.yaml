@@ -1,0 +1,4 @@
+interface:
+  display_name: "cyClaw Session Close"
+  short_description: "Close coding sessions with a cyClaw knowledge review"
+  default_prompt: "Use $cyclaw-session-close to close this coding session with a knowledge check."

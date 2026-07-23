@@ -1,0 +1,20 @@
+<idea-plugin>
+    <id>com.cyclaw.idea</id>
+    <name>cyClaw</name>
+    <vendor url="https://gitee.com/zhu-chengyuu/cy-claw">cyClaw contributors</vendor>
+
+    <description><![CDATA[
+        cyClaw 是 AI Coding 时代的项目知识维护层。插件通过 cyClaw CLI/MCP 展示项目状态、知识候选和文档草稿。
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+            id="cyClaw"
+            anchor="right"
+            icon="/icons/cyclaw.svg"
+            factoryClass="com.cyclaw.idea.CyclawToolWindowFactory"/>
+        <projectService serviceImplementation="com.cyclaw.idea.CyclawProjectService"/>
+    </extensions>
+</idea-plugin>
