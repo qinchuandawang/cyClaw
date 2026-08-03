@@ -5,20 +5,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use cyclaw_agent::{AgentRunOptions, run_agent_once};
 use cyclaw_core::{
-    BeginTaskOptions, DraftOptions, FactOperation, FactPatchRequest, ProjectFact, SearchOptions,
-    apply_document_patch as apply_patch, apply_fact_patch as apply_fact_patch_core,
-    begin_task as begin_project_task, checkpoint_task as checkpoint_project_task,
-    close_task as close_project_task, generate_document_drafts,
-    get_active_task as core_get_active_task,
+    BeginTaskOptions, DraftOptions, FactEvidence, FactInput, FactOperation, FactPatchRequest,
+    FactType, ProjectFact, SearchOptions, apply_document_patch as apply_patch,
+    apply_fact_patch as apply_fact_patch_core, begin_task as begin_project_task,
+    checkpoint_task as checkpoint_project_task, close_task as close_project_task,
+    generate_document_drafts, get_active_task as core_get_active_task,
     get_latest_reconciliation as core_get_latest_reconciliation,
     get_task_context as core_get_task_context, list_document_patches,
     list_fact_patches as core_list_fact_patches, list_inbox,
     list_project_facts as core_list_project_facts, list_tasks as core_list_tasks,
-    preview_fact_patch as preview_fact_patch_core, project_status,
+    preview_fact_patch as preview_fact_patch_core, project_fact_from_input, project_status,
     reconcile_project_knowledge as core_reconcile_project_knowledge, record_task_decision,
     record_task_failed_approach, revert_document_patch as revert_patch,
     revert_fact_patch as revert_fact_patch_core, search_project, update_inbox_status,
-    watch_project_once,
+    verify_fact_evidence as verify_fact_evidence_core, watch_project_once,
 };
 use cyclaw_docs::{DocumentPatchStatus, KnowledgeOperation};
 use cyclaw_events::read_events;
@@ -187,6 +187,12 @@ impl McpServer {
             json!({"name":"preview_fact_patch","description":"预览结构化事实的 create/update/merge/supersede/delete 操作，生成可审计且可撤销的草稿，不修改 Fact Ledger。","inputSchema":object_schema(vec![("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("target_fact_id",json!({"type":"string"})),("source_fact_ids",json!({"type":"array","items":{"type":"string"}})),("fact",json!({"type":"object","description":"create、update、supersede 的完整事实快照；merge 时可选，用于更新主事实。"}))])}),
             json!({"name":"apply_fact_patch","description":"应用指定事实治理草稿，应用前校验事实预览指纹。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
             json!({"name":"revert_fact_patch","description":"撤销指定已应用事实草稿；仅在应用后事实未变化时执行。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
+            json!({"name":"verify_fact_evidence","description":"验证结构化事实证据的路径、符号、行范围和内容哈希，不修改 Fact Ledger。","inputSchema":object_schema(vec![("fact_id",json!({"type":"string"}))])}),
+            fact_operation_tool("create_fact", "生成新增事实草稿", false, false),
+            fact_operation_tool("update_fact", "生成更新事实草稿", true, false),
+            fact_operation_tool("merge_facts", "生成合并事实草稿", true, true),
+            fact_operation_tool("supersede_fact", "生成取代事实草稿", true, false),
+            fact_operation_tool("delete_fact", "生成逻辑删除事实草稿", true, false),
             json!({"name":"run_agent","description":"运行一次 cyClaw Agent，可选择是否调用活动模型。","inputSchema":object_schema(vec![("use_model",json!({"type":"boolean"})),("provider",json!({"type":"string"}))])}),
             json!({"name":"set_runtime_strategy","description":"设置观察、审阅、智能审阅或自动文档策略。","inputSchema":object_schema(vec![("strategy",json!({"type":"string","enum":["observe","review","smart","auto"]})),("auto_apply_min_confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
             json!({"name":"doctor","description":"诊断 Git、配置、模型、权限、知识目录和文档写入状态。","inputSchema":object_schema(vec![])}),
@@ -213,6 +219,11 @@ impl McpServer {
                     | "revert_document_patch"
                     | "apply_fact_patch"
                     | "revert_fact_patch"
+                    | "create_fact"
+                    | "update_fact"
+                    | "merge_facts"
+                    | "supersede_fact"
+                    | "delete_fact"
                     | "set_runtime_strategy"
             );
             let idempotent = matches!(
@@ -227,6 +238,7 @@ impl McpServer {
                     | "list_events"
                     | "list_agent_runs"
                     | "get_candidate_detail"
+                    | "verify_fact_evidence"
                     | "doctor"
             );
             if let Some(object) = tool.as_object_mut() {
@@ -271,6 +283,12 @@ impl McpServer {
             "preview_fact_patch" => self.preview_fact_patch(arguments)?,
             "apply_fact_patch" => self.apply_fact_patch(arguments)?,
             "revert_fact_patch" => self.revert_fact_patch(arguments)?,
+            "verify_fact_evidence" => self.verify_fact_evidence(arguments)?,
+            "create_fact" => self.fact_operation(FactOperation::Create, arguments)?,
+            "update_fact" => self.fact_operation(FactOperation::Update, arguments)?,
+            "merge_facts" => self.fact_operation(FactOperation::Merge, arguments)?,
+            "supersede_fact" => self.fact_operation(FactOperation::Supersede, arguments)?,
+            "delete_fact" => self.fact_operation(FactOperation::Delete, arguments)?,
             "run_agent" => self.run_agent(arguments)?,
             "set_runtime_strategy" => self.set_runtime_strategy(arguments)?,
             "doctor" => self.doctor()?,
@@ -305,6 +323,9 @@ impl McpServer {
             "inbox_pending": status.inbox_pending,
             "draft_total": status.draft_total,
             "draft_pending": status.draft_pending,
+            "fact_patch_total": status.fact_patch_total,
+            "fact_patch_pending": status.fact_patch_pending,
+            "fact_patch_revertible": status.fact_patch_revertible,
             "index_exists": status.index_exists,
             "git_has_changes": status.git_has_changes,
             "suggested_next_steps": status.suggested_next_steps,
@@ -638,6 +659,109 @@ impl McpServer {
         let patch =
             revert_fact_patch_core(&self.project_root, required_string(&arguments, "patch_id")?)?;
         Ok(json!({"patch":patch,"reverted":true}))
+    }
+
+    fn verify_fact_evidence(&self, arguments: Value) -> Result<Value> {
+        Ok(json!({"report": verify_fact_evidence_core(
+            &self.project_root,
+            required_string(&arguments, "fact_id")?,
+        )?}))
+    }
+
+    fn fact_operation(&self, operation: FactOperation, arguments: Value) -> Result<Value> {
+        let target_fact_id = arguments
+            .get("target_fact_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let source_fact_ids = optional_string_array(&arguments, "source_fact_ids")?;
+        let fact = self.fact_from_shortcut(&operation, target_fact_id.as_deref(), &arguments)?;
+        let preview = preview_fact_patch_core(
+            &self.project_root,
+            FactPatchRequest {
+                operation,
+                target_fact_id,
+                source_fact_ids,
+                fact,
+            },
+        )?;
+        if arguments
+            .get("apply")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let patch = apply_fact_patch_core(&self.project_root, &preview.id)?;
+            return Ok(json!({"patch":patch,"ledger_modified":true,"revert_available":true}));
+        }
+        Ok(json!({"patch":preview,"ledger_modified":false,"revert_available":false}))
+    }
+
+    fn fact_from_shortcut(
+        &self,
+        operation: &FactOperation,
+        target_fact_id: Option<&str>,
+        arguments: &Value,
+    ) -> Result<Option<ProjectFact>> {
+        if *operation == FactOperation::Delete {
+            return Ok(None);
+        }
+        let has_overrides = [
+            "statement",
+            "fact_type",
+            "evidence",
+            "evidence_details",
+            "confidence",
+        ]
+        .iter()
+        .any(|name| arguments.get(name).is_some());
+        if *operation == FactOperation::Update && !has_overrides {
+            anyhow::bail!("update_fact 至少需要提供一个修改字段");
+        }
+        if *operation == FactOperation::Merge && !has_overrides {
+            return Ok(None);
+        }
+        let mut fact = if let Some(id) = target_fact_id {
+            core_list_project_facts(&self.project_root)?
+                .into_iter()
+                .find(|fact| fact.id == id)
+                .with_context(|| format!("未找到事实: {}", id))?
+        } else {
+            project_fact_from_input(FactInput {
+                statement: String::new(),
+                fact_type: FactType::Unknown,
+                evidence: Vec::new(),
+                evidence_details: Vec::new(),
+                source_task_id: None,
+                confidence: 90,
+                valid_from: None,
+                valid_until: None,
+            })
+        };
+        if let Some(statement) = arguments.get("statement").and_then(Value::as_str) {
+            fact.statement = statement.to_string();
+        }
+        if matches!(operation, FactOperation::Create | FactOperation::Supersede)
+            && fact.statement.trim().is_empty()
+        {
+            anyhow::bail!("create_fact 和 supersede_fact 必须提供 statement");
+        }
+        if let Some(fact_type) = arguments.get("fact_type").and_then(Value::as_str) {
+            fact.fact_type = fact_type.parse::<FactType>()?;
+        }
+        if arguments.get("evidence").is_some() {
+            fact.evidence = optional_string_array(arguments, "evidence")?;
+            fact.evidence_details.clear();
+        }
+        if let Some(details) = arguments.get("evidence_details") {
+            fact.evidence_details = serde_json::from_value::<Vec<FactEvidence>>(details.clone())?;
+        }
+        if let Some(confidence) = arguments.get("confidence").and_then(Value::as_u64) {
+            fact.confidence = confidence.min(100) as u8;
+        }
+        if matches!(operation, FactOperation::Create | FactOperation::Supersede) {
+            fact.id.clear();
+            fact.supersedes.clear();
+        }
+        Ok(Some(fact))
     }
 
     fn run_agent(&self, arguments: Value) -> Result<Value> {
@@ -1003,6 +1127,45 @@ fn object_schema(properties: Vec<(&str, Value)>) -> Value {
     })
 }
 
+fn fact_operation_tool(name: &str, description: &str, target: bool, sources: bool) -> Value {
+    let mut properties = Vec::new();
+    if name != "delete_fact" {
+        properties.extend([
+            ("statement", json!({"type":"string"})),
+            (
+                "fact_type",
+                json!({"type":"string","enum":["decision","failed_approach","constraint","api_contract","schema_rule","dependency","environment","architecture","operational","unknown"]}),
+            ),
+            (
+                "evidence",
+                json!({"type":"array","items":{"type":"string"}}),
+            ),
+            (
+                "evidence_details",
+                json!({"type":"array","items":{"type":"object"}}),
+            ),
+            (
+                "confidence",
+                json!({"type":"integer","minimum":0,"maximum":100}),
+            ),
+        ]);
+    }
+    properties.push((
+        "apply",
+        json!({"type":"boolean","description":"为 true 时在生成预览后立即应用；默认只生成草稿。"}),
+    ));
+    if target {
+        properties.push(("target_fact_id", json!({"type":"string"})));
+    }
+    if sources {
+        properties.push((
+            "source_fact_ids",
+            json!({"type":"array","items":{"type":"string"}}),
+        ));
+    }
+    json!({"name":name,"description":description,"inputSchema":object_schema(properties)})
+}
+
 fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
     arguments
         .get(name)
@@ -1040,6 +1203,11 @@ fn is_write_tool(name: &str) -> bool {
             | "preview_fact_patch"
             | "apply_fact_patch"
             | "revert_fact_patch"
+            | "create_fact"
+            | "update_fact"
+            | "merge_facts"
+            | "supersede_fact"
+            | "delete_fact"
             | "run_agent"
             | "set_runtime_strategy"
             | "begin_task"
@@ -1257,6 +1425,31 @@ mod tests {
         assert_eq!(applied["patch"]["status"], "applied");
         let reverted = server.revert_fact_patch(json!({"patch_id":id})).unwrap();
         assert_eq!(reverted["patch"]["status"], "reverted");
+    }
+
+    #[test]
+    fn ergonomic_fact_tool_applies_and_verifies_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(temp.path().to_path_buf());
+        let created = server
+            .fact_operation(
+                FactOperation::Create,
+                json!({
+                    "statement":"MCP 事实操作必须生成草稿",
+                    "fact_type":"constraint",
+                    "evidence":["missing.rs"],
+                    "confidence":95,
+                    "apply":true
+                }),
+            )
+            .unwrap();
+        assert_eq!(created["patch"]["status"], "applied");
+        let fact_id = created["patch"]["after"][0]["id"].as_str().unwrap();
+        let verification = server
+            .verify_fact_evidence(json!({"fact_id":fact_id}))
+            .unwrap();
+        assert_eq!(verification["report"]["issue_count"], 1);
+        assert_eq!(verification["report"]["results"][0]["status"], "missing");
     }
 
     fn framed(value: Value) -> String {

@@ -409,7 +409,14 @@ fn replace_ranges(original: &str, replacements: &[(Range<usize>, String)]) -> St
     let mut ordered = replacements.to_vec();
     ordered.sort_by_key(|item| std::cmp::Reverse(item.0.start));
     for (range, replacement) in ordered {
-        content.replace_range(range, replacement.trim_end());
+        let replacement = if replacement.trim().is_empty() {
+            String::new()
+        } else if content[range.end..].trim().is_empty() {
+            format!("{}\n", replacement.trim_end())
+        } else {
+            format!("{}\n\n", replacement.trim_end())
+        };
+        content.replace_range(range, &replacement);
     }
     content
 }
@@ -613,6 +620,7 @@ mod tests {
         assert!(!patch.proposed_content.contains("使用旧版"));
         assert!(patch.proposed_content.contains("使用新版"));
         assert!(patch.proposed_content.contains("## 保留"));
+        assert!(patch.proposed_content.contains("使用新版。\n\n## 保留"));
     }
 
     #[test]

@@ -18,8 +18,10 @@ use cyclaw_knowledge::{
     KnowledgeCandidate, KnowledgeStatus, candidates_from_change_analysis, parse_jsonl, render_jsonl,
 };
 pub use cyclaw_memory::{
-    BeginTaskOptions, FactContext, FactEvidence, FactOperation, FactPatch, FactPatchRequest,
-    FailedApproach, ProjectFact, ReconciliationReport, TaskCheckpoint, TaskDecision, TaskRecord,
+    BeginTaskOptions, EvidenceVerificationStatus, FactContext, FactEvidence,
+    FactEvidenceVerification, FactInput, FactOperation, FactPatch, FactPatchRequest,
+    FactPatchStatus, FactType, FactVerificationReport, FailedApproach, ProjectFact,
+    ReconciliationReport, TaskCheckpoint, TaskDecision, TaskRecord,
 };
 use cyclaw_memory::{
     apply_fact_patch as memory_apply_fact_patch, begin_task as memory_begin_task,
@@ -28,9 +30,11 @@ use cyclaw_memory::{
     latest_reconciliation as memory_latest_reconciliation,
     list_fact_patches as memory_list_fact_patches, list_facts as memory_list_facts,
     list_tasks as memory_list_tasks, preview_fact_patch as memory_preview_fact_patch,
+    project_fact_from_input as memory_project_fact_from_input,
     reconcile_knowledge as memory_reconcile_knowledge, record_decision as memory_record_decision,
     record_failed_approach as memory_record_failed_approach,
     revert_fact_patch as memory_revert_fact_patch,
+    verify_fact_evidence as memory_verify_fact_evidence,
 };
 use cyclaw_policy::{PermissionLevel, acquire_lock, check_write_path, load_or_default};
 use cyclaw_retrieval::{IndexSummary, SearchResult, build_index, search_index};
@@ -249,6 +253,9 @@ pub struct ProjectStatus {
     pub inbox_pending: usize,
     pub draft_total: usize,
     pub draft_pending: usize,
+    pub fact_patch_total: usize,
+    pub fact_patch_pending: usize,
+    pub fact_patch_revertible: usize,
     pub index_exists: bool,
     pub git_has_changes: bool,
     pub suggested_next_steps: Vec<String>,
@@ -811,6 +818,7 @@ pub fn project_status(project_root: PathBuf) -> Result<ProjectStatus> {
     let latest_run = latest_change_analysis_path(&project_root).ok();
     let inbox = read_inbox_candidates(&project_root).unwrap_or_default();
     let drafts = list_document_patches(project_root.clone()).unwrap_or_default();
+    let fact_patches = memory_list_fact_patches(&project_root).unwrap_or_default();
     let index = index_path(&project_root);
     let git_has_changes = current_change_fingerprint(&project_root)
         .map(|fingerprint| !fingerprint.trim().is_empty())
@@ -823,6 +831,14 @@ pub fn project_status(project_root: PathBuf) -> Result<ProjectStatus> {
     let draft_pending = drafts
         .iter()
         .filter(|patch| patch.status == cyclaw_docs::DocumentPatchStatus::Pending)
+        .count();
+    let fact_patch_pending = fact_patches
+        .iter()
+        .filter(|patch| patch.status == FactPatchStatus::Pending)
+        .count();
+    let fact_patch_revertible = fact_patches
+        .iter()
+        .filter(|patch| patch.status == FactPatchStatus::Applied)
         .count();
 
     let mut status = ProjectStatus {
@@ -837,6 +853,9 @@ pub fn project_status(project_root: PathBuf) -> Result<ProjectStatus> {
         inbox_pending,
         draft_total: drafts.len(),
         draft_pending,
+        fact_patch_total: fact_patches.len(),
+        fact_patch_pending,
+        fact_patch_revertible,
         index_exists: index.exists(),
         git_has_changes,
         suggested_next_steps: Vec::new(),
@@ -911,6 +930,14 @@ pub fn revert_fact_patch(project_root: &Path, patch_id: &str) -> Result<FactPatc
 
 pub fn list_fact_patches(project_root: &Path) -> Result<Vec<FactPatch>> {
     memory_list_fact_patches(project_root)
+}
+
+pub fn project_fact_from_input(input: FactInput) -> ProjectFact {
+    memory_project_fact_from_input(input)
+}
+
+pub fn verify_fact_evidence(project_root: &Path, fact_id: &str) -> Result<FactVerificationReport> {
+    memory_verify_fact_evidence(project_root, fact_id)
 }
 
 pub fn get_latest_reconciliation(project_root: &Path) -> Result<Option<ReconciliationReport>> {
@@ -1185,6 +1212,10 @@ fn suggested_next_steps(status: &ProjectStatus) -> Vec<String> {
     if status.draft_pending > 0 {
         steps.push("运行 `cyclaw draft list` 查看文档草稿".to_string());
         steps.push("运行 `cyclaw draft apply <id>` 应用确认后的文档草稿".to_string());
+    }
+
+    if status.fact_patch_pending > 0 {
+        steps.push("运行 `cyclaw fact list` 查看待应用事实治理草稿".to_string());
     }
 
     if !status.index_exists {

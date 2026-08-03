@@ -4,6 +4,8 @@
 
 - 最低支持 Rust `1.85`；GitHub CI 使用 Rust `1.96.0`。
 - 主要运行时依赖：`clap`、`serde`、`rusqlite`（bundled SQLite）、`notify`、`pulldown-cmark`、`reqwest`。
+- `sha2` 用于 FactEvidence 内容哈希采集与验证。
+- `tempfile` 用于 Fact Ledger 和 Fact Patch 的同目录原子替换。
 - 使用 `Cargo.lock` 固定解析后的依赖版本。
 
 ## 编辑器插件

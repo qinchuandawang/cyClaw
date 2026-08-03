@@ -9,15 +9,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cyclaw_agent::{AgentRunOptions, cleanup_agent_runs, list_agent_runs, run_agent_once};
 use cyclaw_core::{
-    BeginTaskOptions, DiffOptions, DraftOptions, FactOperation, FactPatchRequest,
-    InboxGenerateOptions, InitOptions, ProjectFact, ScanOptions, SearchOptions,
-    analyze_project_diff, apply_document_patch, apply_fact_patch, begin_task, checkpoint_task,
-    close_task, current_change_snapshot, generate_document_drafts, generate_inbox, get_active_task,
-    get_latest_reconciliation, get_task_context, index_project, init_project,
+    BeginTaskOptions, DiffOptions, DraftOptions, FactInput, FactOperation, FactPatch,
+    FactPatchRequest, FactType, InboxGenerateOptions, InitOptions, ProjectFact, ScanOptions,
+    SearchOptions, analyze_project_diff, apply_document_patch, apply_fact_patch, begin_task,
+    checkpoint_task, close_task, current_change_snapshot, generate_document_drafts, generate_inbox,
+    get_active_task, get_latest_reconciliation, get_task_context, index_project, init_project,
     list_document_patches, list_fact_patches, list_inbox, list_project_facts, list_tasks,
-    preview_fact_patch, project_status, reconcile_project_knowledge, record_task_decision,
-    record_task_failed_approach, revert_document_patch, revert_fact_patch, scan_project,
-    search_project, update_inbox_status, watch_project_once,
+    preview_fact_patch, project_fact_from_input, project_status, reconcile_project_knowledge,
+    record_task_decision, record_task_failed_approach, revert_document_patch, revert_fact_patch,
+    scan_project, search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
 };
 use cyclaw_docs::KnowledgeOperation;
 use cyclaw_knowledge::{KnowledgeImportance, KnowledgeStatus};
@@ -244,6 +244,77 @@ enum DraftCommand {
 
 #[derive(Subcommand)]
 enum FactCommand {
+    /// 新增事实；默认只生成草稿
+    Create {
+        statement: String,
+        #[arg(long, default_value = "unknown")]
+        fact_type: String,
+        #[arg(long = "evidence")]
+        evidence: Vec<String>,
+        #[arg(long, default_value_t = 90)]
+        confidence: u8,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 更新 Active Fact 并保留原 ID
+    Update {
+        id: String,
+        #[arg(long)]
+        statement: Option<String>,
+        #[arg(long)]
+        fact_type: Option<String>,
+        #[arg(long = "evidence")]
+        evidence: Vec<String>,
+        #[arg(long)]
+        confidence: Option<u8>,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 合并重复事实并保留主 Fact
+    Merge {
+        target: String,
+        #[arg(long = "source", required = true)]
+        sources: Vec<String>,
+        #[arg(long)]
+        statement: Option<String>,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 用新事实取代旧 Active Fact
+    Supersede {
+        target: String,
+        statement: String,
+        #[arg(long, default_value = "unknown")]
+        fact_type: String,
+        #[arg(long = "evidence")]
+        evidence: Vec<String>,
+        #[arg(long, default_value_t = 90)]
+        confidence: u8,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 将 Active Fact 标记为 Deleted
+    Delete {
+        id: String,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 校验证据路径、符号、行范围和内容哈希
+    Verify {
+        id: String,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
     /// 预览 create/update/merge/supersede/delete 事实操作
     Preview {
         #[arg(long)]
@@ -624,6 +695,9 @@ fn main() -> Result<()> {
             println!("待处理候选知识: {}", status.inbox_pending);
             println!("文档草稿总数: {}", status.draft_total);
             println!("待应用文档草稿: {}", status.draft_pending);
+            println!("事实草稿总数: {}", status.fact_patch_total);
+            println!("待应用事实草稿: {}", status.fact_patch_pending);
+            println!("可撤销事实草稿: {}", status.fact_patch_revertible);
             println!("本地索引: {}", render_bool(status.index_exists));
             println!();
             println!("建议下一步:");
@@ -751,6 +825,139 @@ fn main() -> Result<()> {
             }
         },
         Commands::Fact { command } => match command {
+            FactCommand::Create {
+                statement,
+                fact_type,
+                evidence,
+                confidence,
+                apply,
+                path,
+            } => {
+                let root = resolve_path(path)?;
+                let fact = new_fact(statement, fact_type.parse()?, evidence, confidence);
+                let patch = preview_fact_patch(
+                    &root,
+                    FactPatchRequest {
+                        operation: FactOperation::Create,
+                        target_fact_id: None,
+                        source_fact_ids: Vec::new(),
+                        fact: Some(fact),
+                    },
+                )?;
+                finish_fact_preview(&root, patch, apply)?;
+            }
+            FactCommand::Update {
+                id,
+                statement,
+                fact_type,
+                evidence,
+                confidence,
+                apply,
+                path,
+            } => {
+                let root = resolve_path(path)?;
+                if statement.is_none()
+                    && fact_type.is_none()
+                    && evidence.is_empty()
+                    && confidence.is_none()
+                {
+                    anyhow::bail!("fact update 至少需要提供一个修改字段");
+                }
+                let mut fact = find_project_fact(&root, &id)?;
+                if let Some(statement) = statement {
+                    fact.statement = statement;
+                }
+                if let Some(fact_type) = fact_type {
+                    fact.fact_type = fact_type.parse()?;
+                }
+                if !evidence.is_empty() {
+                    fact.evidence = evidence;
+                    fact.evidence_details.clear();
+                }
+                if let Some(confidence) = confidence {
+                    fact.confidence = confidence.min(100);
+                }
+                let patch = preview_fact_patch(
+                    &root,
+                    FactPatchRequest {
+                        operation: FactOperation::Update,
+                        target_fact_id: Some(id),
+                        source_fact_ids: Vec::new(),
+                        fact: Some(fact),
+                    },
+                )?;
+                finish_fact_preview(&root, patch, apply)?;
+            }
+            FactCommand::Merge {
+                target,
+                sources,
+                statement,
+                apply,
+                path,
+            } => {
+                let root = resolve_path(path)?;
+                let fact = statement
+                    .map(|statement| {
+                        let mut fact = find_project_fact(&root, &target)?;
+                        fact.statement = statement;
+                        Ok::<ProjectFact, anyhow::Error>(fact)
+                    })
+                    .transpose()?;
+                let patch = preview_fact_patch(
+                    &root,
+                    FactPatchRequest {
+                        operation: FactOperation::Merge,
+                        target_fact_id: Some(target),
+                        source_fact_ids: sources,
+                        fact,
+                    },
+                )?;
+                finish_fact_preview(&root, patch, apply)?;
+            }
+            FactCommand::Supersede {
+                target,
+                statement,
+                fact_type,
+                evidence,
+                confidence,
+                apply,
+                path,
+            } => {
+                let root = resolve_path(path)?;
+                let fact = new_fact(statement, fact_type.parse()?, evidence, confidence);
+                let patch = preview_fact_patch(
+                    &root,
+                    FactPatchRequest {
+                        operation: FactOperation::Supersede,
+                        target_fact_id: Some(target),
+                        source_fact_ids: Vec::new(),
+                        fact: Some(fact),
+                    },
+                )?;
+                finish_fact_preview(&root, patch, apply)?;
+            }
+            FactCommand::Delete { id, apply, path } => {
+                let root = resolve_path(path)?;
+                let patch = preview_fact_patch(
+                    &root,
+                    FactPatchRequest {
+                        operation: FactOperation::Delete,
+                        target_fact_id: Some(id),
+                        source_fact_ids: Vec::new(),
+                        fact: None,
+                    },
+                )?;
+                finish_fact_preview(&root, patch, apply)?;
+            }
+            FactCommand::Verify { id, path } => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&verify_fact_evidence(
+                        &resolve_path(path)?,
+                        &id
+                    )?)?
+                );
+            }
             FactCommand::Preview {
                 operation,
                 target,
@@ -1340,6 +1547,50 @@ fn resolve_path(path: Option<PathBuf>) -> Result<PathBuf> {
         None => std::env::current_dir()?,
     };
     Ok(path.canonicalize()?)
+}
+
+fn new_fact(
+    statement: String,
+    fact_type: FactType,
+    evidence: Vec<String>,
+    confidence: u8,
+) -> ProjectFact {
+    project_fact_from_input(FactInput {
+        statement,
+        fact_type,
+        evidence,
+        evidence_details: Vec::new(),
+        source_task_id: None,
+        confidence,
+        valid_from: None,
+        valid_until: None,
+    })
+}
+
+fn find_project_fact(project_root: &Path, fact_id: &str) -> Result<ProjectFact> {
+    list_project_facts(project_root)?
+        .into_iter()
+        .find(|fact| fact.id == fact_id)
+        .ok_or_else(|| anyhow::anyhow!("未找到事实: {}", fact_id))
+}
+
+fn finish_fact_preview(project_root: &Path, patch: FactPatch, apply: bool) -> Result<()> {
+    println!("事实草稿: {}", patch.id);
+    println!("操作: {:?}", patch.operation);
+    println!("预览指纹: {}", patch.preview_fingerprint);
+    if apply {
+        let patch = apply_fact_patch(project_root, &patch.id)?;
+        println!(
+            "已应用事实草稿: {}；可使用 `cyclaw fact revert {}` 撤销",
+            patch.id, patch.id
+        );
+    } else {
+        println!(
+            "Fact Ledger 未修改；使用 `cyclaw fact apply {}` 应用",
+            patch.id
+        );
+    }
+    Ok(())
 }
 
 const CYCLAW_HOOK_MARKER: &str = "# managed-by-cyclaw";

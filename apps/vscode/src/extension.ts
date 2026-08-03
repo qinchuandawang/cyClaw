@@ -26,6 +26,9 @@ interface ProjectStatus {
   git_has_changes: boolean;
   inbox_pending: number;
   draft_pending: number;
+  fact_patch_total: number;
+  fact_patch_pending: number;
+  fact_patch_revertible: number;
   index_exists: boolean;
   suggested_next_steps: string[];
 }
@@ -397,6 +400,8 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
           leaf(`Git 未提交变更: ${status.git_has_changes ? "是" : "否"}`, "git-compare"),
           leaf(`待处理候选知识: ${status.inbox_pending}`, "inbox"),
           leaf(`待应用文档草稿: ${status.draft_pending}`, "diff"),
+          leaf(`待应用事实草稿: ${status.fact_patch_pending}`, "database"),
+          leaf(`可撤销事实草稿: ${status.fact_patch_revertible}`, "history"),
           leaf(`本地索引: ${status.index_exists ? "是" : "否"}`, "database")
         ]
       : [leaf("暂无状态，请先刷新", "info")];
@@ -470,11 +475,11 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
   }
 
   private factPatchesSection(): CyclawTreeItem {
-    const children = this.snapshot.factPatches.length ? this.snapshot.factPatches.map((patch) => {
-      const item = leaf(`${knowledgeOperationLabel(patch.operation)} · ${patch.status}`, "database", "factPatch", patch.id);
+    const children = this.snapshot.factPatches.length ? [...this.snapshot.factPatches].sort((left, right) => factPatchStatusOrder(left.status) - factPatchStatusOrder(right.status)).map((patch) => {
+      const item = leaf(`${knowledgeOperationLabel(patch.operation)} · ${factPatchStatusLabel(patch.status)}`, "database", "factPatch", patch.id);
       item.contextValue = "cyclawFactPatch";
       item.description = patch.target_fact_id ?? patch.after[0]?.id ?? "新事实";
-      item.tooltip = `ID: ${patch.id}\n操作: ${knowledgeOperationLabel(patch.operation)}\n状态: ${patch.status}\n预览指纹: ${patch.preview_fingerprint}`;
+      item.tooltip = `ID: ${patch.id}\n操作: ${knowledgeOperationLabel(patch.operation)}\n状态: ${factPatchStatusLabel(patch.status)}\n预览指纹: ${patch.preview_fingerprint}`;
       item.command = { command: "cyclaw.openFactPatch", title: "预览事实草稿", arguments: [item] };
       return item;
     }) : [leaf("暂无事实治理草稿", "pass")];
@@ -528,6 +533,9 @@ class CyclawDashboardProvider implements vscode.WebviewViewProvider {
         await vscode.commands.executeCommand("cyclaw.openCandidateById", message.id);
       } else if (message.command === "openPatch" && typeof message.id === "string") {
         await vscode.commands.executeCommand("cyclaw.openPatchById", message.id);
+      } else if (message.command === "openFactPatch" && typeof message.id === "string") {
+        const item = new CyclawTreeItem("事实草稿", vscode.TreeItemCollapsibleState.None, "factPatch", message.id);
+        await vscode.commands.executeCommand("cyclaw.openFactPatch", item);
       }
     });
     this.render();
@@ -1216,6 +1224,7 @@ async function refresh(provider: CyclawKnowledgeProvider): Promise<void> {
       status,
       candidates: pending.candidates.length,
       patches: patches.patches.length,
+      factPatches: status.fact_patch_pending,
       activeTask: active.task
     });
   } catch (error) {
@@ -1231,12 +1240,12 @@ async function refresh(provider: CyclawKnowledgeProvider): Promise<void> {
   }
 }
 
-function updateStatusBar(value: { status: ProjectStatus; candidates: number; patches: number; activeTask?: TaskRecord }): void {
-  const pending = value.candidates + value.patches;
+function updateStatusBar(value: { status: ProjectStatus; candidates: number; patches: number; factPatches: number; activeTask?: TaskRecord }): void {
+  const pending = value.candidates + value.patches + value.factPatches;
   statusBarItem.text = value.activeTask
     ? `$(target) cyClaw · ${value.activeTask.title}`
     : pending > 0
-    ? `$(book) cyClaw ${value.candidates} 候选 · ${value.patches} 草稿`
+    ? `$(book) cyClaw ${value.candidates} 候选 · ${value.patches} 文档 · ${value.factPatches} 事实`
     : "$(check) cyClaw 已同步";
   statusBarItem.backgroundColor = pending > 0
     ? new vscode.ThemeColor("statusBarItem.warningBackground")
@@ -1244,7 +1253,7 @@ function updateStatusBar(value: { status: ProjectStatus; candidates: number; pat
   statusBarItem.tooltip = value.activeTask
     ? `当前任务: ${value.activeTask.title}\n目标: ${value.activeTask.objective}\n决策: ${value.activeTask.decisions.length}\n失败方案: ${value.activeTask.failed_approaches.length}`
     : pending > 0
-    ? `项目已连接\n待处理候选知识: ${value.candidates}\n待应用文档草稿: ${value.patches}\n点击运行 Agent`
+    ? `项目已连接\n待处理候选知识: ${value.candidates}\n待应用文档草稿: ${value.patches}\n待应用事实草稿: ${value.factPatches}\n点击运行 Agent`
     : "项目知识状态已同步，点击运行 Agent";
 }
 
@@ -1555,6 +1564,11 @@ function renderDashboardHtml(snapshot: KnowledgeSnapshot, context: vscode.Extens
       <span class="work-main"><strong>${escapeHtml(patch.summary)}</strong><small>${escapeHtml(patch.target_doc)}</small></span>
       <span class="tag">${escapeHtml(knowledgeOperationLabel(patch.operation))}</span>
     </button>`).join("");
+  const factPatches = snapshot.factPatches.filter((patch) => patch.status !== "reverted").slice(0, 3).map((patch) => `
+    <button class="work-item" data-kind="factPatch" data-id="${escapeHtml(patch.id)}">
+      <span class="work-main"><strong>${escapeHtml(patch.after[0]?.statement ?? patch.before[0]?.statement ?? patch.id)}</strong><small>${escapeHtml(factPatchStatusLabel(patch.status))}</small></span>
+      <span class="tag">${escapeHtml(knowledgeOperationLabel(patch.operation))}</span>
+    </button>`).join("");
   const task = snapshot.activeTask;
   const contextFacts = snapshot.taskContext?.facts.facts.slice(0, 3).map((item) => `
     <li><strong>${escapeHtml(item.fact.statement)}</strong><small>${escapeHtml(item.relevance_reason)} · ${item.fact.confidence}%</small></li>`).join("") ?? "";
@@ -1580,18 +1594,18 @@ function renderDashboardHtml(snapshot: KnowledgeSnapshot, context: vscode.Extens
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>
-:root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;padding:0 0 18px;color:var(--vscode-foreground);background:var(--vscode-sideBar-background);font-family:var(--vscode-font-family);font-size:13px;line-height:1.45;letter-spacing:0}.shell{min-width:0}.brand{padding:18px 16px 14px;border-bottom:1px solid var(--vscode-sideBarSectionHeader-border,var(--vscode-panel-border));background:var(--vscode-sideBarSectionHeader-background)}.brand-row{display:flex;align-items:center;justify-content:space-between;gap:10px}.brand h1{font-size:20px;line-height:1.2;margin:0;font-weight:650}.brand .version{font-size:11px;color:var(--vscode-descriptionForeground)}.brand p{margin:7px 0 0;color:var(--vscode-descriptionForeground);font-size:12px}.task-band{padding:14px;border-bottom:1px solid var(--vscode-panel-border);background:var(--vscode-textBlockQuote-background)}.task-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.task-heading span,.empty-task span{font-size:11px;color:var(--vscode-descriptionForeground)}.task-band h2{font-size:15px;margin:2px 0 0}.task-band p{margin:7px 0;color:var(--vscode-descriptionForeground);font-size:12px}.task-metrics{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;padding:8px 0;border-top:1px solid var(--vscode-panel-border);border-bottom:1px solid var(--vscode-panel-border);font-size:11px}.task-band h3{font-size:11px;margin:10px 0 4px;color:var(--vscode-descriptionForeground)}.context-facts{list-style:none;padding:0;margin:0}.context-facts li{padding:5px 0;border-bottom:1px solid var(--vscode-panel-border)}.context-facts strong,.context-facts small{display:block}.context-facts strong{font-size:12px}.context-facts small{margin-top:2px;color:var(--vscode-descriptionForeground);font-size:10px}.task-actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-top:10px}.empty-task{display:flex;align-items:center;justify-content:space-between;gap:10px}.empty-task>div{min-width:0}.empty.compact{padding:8px 0}.memory-alert{display:flex;justify-content:space-between;gap:10px;padding:8px 14px;border-bottom:1px solid var(--vscode-panel-border);color:var(--vscode-editorWarning-foreground);background:var(--vscode-inputValidation-warningBackground);font-size:11px}.tag.active{color:var(--vscode-testing-iconPassed);background:var(--vscode-diffEditor-insertedTextBackground)}.status-strip{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-bottom:1px solid var(--vscode-panel-border)}.stat{padding:12px 10px;border-right:1px solid var(--vscode-panel-border);min-width:0}.stat:last-child{border-right:0}.stat strong{display:block;font-size:18px;line-height:1.1}.stat span{display:block;margin-top:5px;color:var(--vscode-descriptionForeground);font-size:11px;overflow-wrap:anywhere}.section{padding:15px 14px 0}.section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.section h2{font-size:12px;text-transform:uppercase;margin:0;color:var(--vscode-descriptionForeground);font-weight:650}.state{display:flex;align-items:center;gap:7px;font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:var(--vscode-testing-iconPassed)}.dot.off{background:var(--vscode-descriptionForeground)}.mode-band{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-left:3px solid var(--vscode-focusBorder);background:var(--vscode-textBlockQuote-background)}.mode-band strong{font-size:14px}.mode-band span{font-size:11px;color:var(--vscode-descriptionForeground)}.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.action{min-height:34px;border:1px solid var(--vscode-button-border,transparent);border-radius:4px;padding:7px 9px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;text-align:left;cursor:pointer}.action:hover{background:var(--vscode-button-secondaryHoverBackground)}.action.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.action.primary:hover{background:var(--vscode-button-hoverBackground)}.work-list{display:flex;flex-direction:column;border-top:1px solid var(--vscode-panel-border)}.work-item{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:10px 2px;border:0;border-bottom:1px solid var(--vscode-panel-border);background:transparent;color:var(--vscode-foreground);font:inherit;text-align:left;cursor:pointer}.work-item:hover{background:var(--vscode-list-hoverBackground)}.work-main{min-width:0}.work-main strong,.work-main small{display:block;overflow:hidden;text-overflow:ellipsis}.work-main strong{white-space:normal;font-weight:550}.work-main small{margin-top:3px;color:var(--vscode-descriptionForeground);white-space:nowrap}.score,.tag{flex:0 0 auto;border-radius:3px;padding:2px 5px;font-size:11px}.score.high{color:var(--vscode-testing-iconPassed);background:var(--vscode-diffEditor-insertedTextBackground)}.score.medium,.tag{color:var(--vscode-editorWarning-foreground);background:var(--vscode-diffEditor-unchangedRegionBackground)}.score.low{color:var(--vscode-errorForeground);background:var(--vscode-diffEditor-removedTextBackground)}.events{list-style:none;margin:0;padding:0}.events li{display:grid;grid-template-columns:8px minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 0}.event-mark{width:6px;height:6px;border-radius:50%;background:var(--vscode-focusBorder)}.event-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.events time{color:var(--vscode-descriptionForeground);font-size:11px}.empty{padding:14px 0;color:var(--vscode-descriptionForeground);font-size:12px}.notice{margin:12px 14px 0;padding:10px 12px;border-left:3px solid var(--vscode-editorWarning-foreground);background:var(--vscode-inputValidation-warningBackground)}.notice strong,.notice span{display:block}.notice span{margin-top:4px;font-size:12px}.notice.error{border-left-color:var(--vscode-errorForeground);background:var(--vscode-inputValidation-errorBackground)}@media(max-width:320px){.status-strip{grid-template-columns:1fr}.stat{border-right:0;border-bottom:1px solid var(--vscode-panel-border)}.actions,.task-actions{grid-template-columns:1fr}.mode-band,.empty-task{align-items:flex-start;flex-direction:column}}
+:root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;padding:0 0 18px;color:var(--vscode-foreground);background:var(--vscode-sideBar-background);font-family:var(--vscode-font-family);font-size:13px;line-height:1.45;letter-spacing:0}.shell{min-width:0}.brand{padding:18px 16px 14px;border-bottom:1px solid var(--vscode-sideBarSectionHeader-border,var(--vscode-panel-border));background:var(--vscode-sideBarSectionHeader-background)}.brand-row{display:flex;align-items:center;justify-content:space-between;gap:10px}.brand h1{font-size:20px;line-height:1.2;margin:0;font-weight:650}.brand .version{font-size:11px;color:var(--vscode-descriptionForeground)}.brand p{margin:7px 0 0;color:var(--vscode-descriptionForeground);font-size:12px}.task-band{padding:14px;border-bottom:1px solid var(--vscode-panel-border);background:var(--vscode-textBlockQuote-background)}.task-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.task-heading span,.empty-task span{font-size:11px;color:var(--vscode-descriptionForeground)}.task-band h2{font-size:15px;margin:2px 0 0}.task-band p{margin:7px 0;color:var(--vscode-descriptionForeground);font-size:12px}.task-metrics{display:grid;grid-template-columns:1fr 1fr;gap:5px 10px;padding:8px 0;border-top:1px solid var(--vscode-panel-border);border-bottom:1px solid var(--vscode-panel-border);font-size:11px}.task-band h3{font-size:11px;margin:10px 0 4px;color:var(--vscode-descriptionForeground)}.context-facts{list-style:none;padding:0;margin:0}.context-facts li{padding:5px 0;border-bottom:1px solid var(--vscode-panel-border)}.context-facts strong,.context-facts small{display:block}.context-facts strong{font-size:12px}.context-facts small{margin-top:2px;color:var(--vscode-descriptionForeground);font-size:10px}.task-actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-top:10px}.empty-task{display:flex;align-items:center;justify-content:space-between;gap:10px}.empty-task>div{min-width:0}.empty.compact{padding:8px 0}.memory-alert{display:flex;justify-content:space-between;gap:10px;padding:8px 14px;border-bottom:1px solid var(--vscode-panel-border);color:var(--vscode-editorWarning-foreground);background:var(--vscode-inputValidation-warningBackground);font-size:11px}.tag.active{color:var(--vscode-testing-iconPassed);background:var(--vscode-diffEditor-insertedTextBackground)}.status-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-bottom:1px solid var(--vscode-panel-border)}.stat{padding:12px 10px;border-right:1px solid var(--vscode-panel-border);min-width:0}.stat:last-child{border-right:0}.stat strong{display:block;font-size:18px;line-height:1.1}.stat span{display:block;margin-top:5px;color:var(--vscode-descriptionForeground);font-size:11px;overflow-wrap:anywhere}.section{padding:15px 14px 0}.section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.section h2{font-size:12px;text-transform:uppercase;margin:0;color:var(--vscode-descriptionForeground);font-weight:650}.state{display:flex;align-items:center;gap:7px;font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:var(--vscode-testing-iconPassed)}.dot.off{background:var(--vscode-descriptionForeground)}.mode-band{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-left:3px solid var(--vscode-focusBorder);background:var(--vscode-textBlockQuote-background)}.mode-band strong{font-size:14px}.mode-band span{font-size:11px;color:var(--vscode-descriptionForeground)}.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.action{min-height:34px;border:1px solid var(--vscode-button-border,transparent);border-radius:4px;padding:7px 9px;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);font:inherit;text-align:left;cursor:pointer}.action:hover{background:var(--vscode-button-secondaryHoverBackground)}.action.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.action.primary:hover{background:var(--vscode-button-hoverBackground)}.work-list{display:flex;flex-direction:column;border-top:1px solid var(--vscode-panel-border)}.work-item{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:10px 2px;border:0;border-bottom:1px solid var(--vscode-panel-border);background:transparent;color:var(--vscode-foreground);font:inherit;text-align:left;cursor:pointer}.work-item:hover{background:var(--vscode-list-hoverBackground)}.work-main{min-width:0}.work-main strong,.work-main small{display:block;overflow:hidden;text-overflow:ellipsis}.work-main strong{white-space:normal;font-weight:550}.work-main small{margin-top:3px;color:var(--vscode-descriptionForeground);white-space:nowrap}.score,.tag{flex:0 0 auto;border-radius:3px;padding:2px 5px;font-size:11px}.score.high{color:var(--vscode-testing-iconPassed);background:var(--vscode-diffEditor-insertedTextBackground)}.score.medium,.tag{color:var(--vscode-editorWarning-foreground);background:var(--vscode-diffEditor-unchangedRegionBackground)}.score.low{color:var(--vscode-errorForeground);background:var(--vscode-diffEditor-removedTextBackground)}.events{list-style:none;margin:0;padding:0}.events li{display:grid;grid-template-columns:8px minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 0}.event-mark{width:6px;height:6px;border-radius:50%;background:var(--vscode-focusBorder)}.event-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.events time{color:var(--vscode-descriptionForeground);font-size:11px}.empty{padding:14px 0;color:var(--vscode-descriptionForeground);font-size:12px}.notice{margin:12px 14px 0;padding:10px 12px;border-left:3px solid var(--vscode-editorWarning-foreground);background:var(--vscode-inputValidation-warningBackground)}.notice strong,.notice span{display:block}.notice span{margin-top:4px;font-size:12px}.notice.error{border-left-color:var(--vscode-errorForeground);background:var(--vscode-inputValidation-errorBackground)}@media(max-width:380px){.status-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.stat{border-bottom:1px solid var(--vscode-panel-border)}.actions,.task-actions{grid-template-columns:1fr}.mode-band,.empty-task{align-items:flex-start;flex-direction:column}}
 </style></head><body><main class="shell">
 <header class="brand"><div class="brand-row"><h1>cyClaw</h1><span class="version">v${escapeHtml(String(context.extension.packageJSON.version ?? "0.1.0"))}</span></div><p>Coding Agent 的项目记忆与上下文控制层</p></header>
 ${error}
 ${taskSection}
 ${reconciliationNotice}
-<div class="status-strip"><div class="stat"><strong>${snapshot.candidates.length}</strong><span>待处理候选</span></div><div class="stat"><strong>${snapshot.patches.length}</strong><span>文档草稿</span></div><div class="stat"><strong>${status?.git_has_changes ? "有" : "无"}</strong><span>Git 变化</span></div></div>
+<div class="status-strip"><div class="stat"><strong>${snapshot.candidates.length}</strong><span>待处理候选</span></div><div class="stat"><strong>${snapshot.patches.length}</strong><span>文档草稿</span></div><div class="stat"><strong>${status?.fact_patch_pending ?? 0}</strong><span>事实草稿</span></div><div class="stat"><strong>${status?.git_has_changes ? "有" : "无"}</strong><span>Git 变化</span></div></div>
 <section class="section"><div class="section-head"><h2>运行状态</h2><div class="state"><span class="dot ${watching ? "" : "off"}"></span>${watching ? "事件监听中" : "监听已停止"}</div></div><div class="mode-band"><div><strong>${escapeHtml(mode)}</strong><br><span>${escapeHtml(snapshot.models?.active_provider ? `模型：${snapshot.models.active_provider}` : "本地规则")}</span></div><button class="action" data-command="cyclaw.configureMode">选择策略</button></div></section>
 <section class="section"><div class="section-head"><h2>快捷操作</h2></div><div class="actions"><button class="action primary" data-command="cyclaw.runAgent">运行 Agent</button><button class="action" data-command="cyclaw.watchOnce">检查变化</button><button class="action" data-command="cyclaw.batchCandidates">批量处理</button><button class="action" data-command="cyclaw.configureModel">配置模型</button><button class="action" data-command="cyclaw.configurePermissions">高级权限</button><button class="action" data-command="cyclaw.showOutput">运行日志</button></div></section>
-<section class="section"><div class="section-head"><h2>待处理</h2><span>${snapshot.candidates.length + snapshot.patches.length} 项</span></div><div class="work-list">${candidates}${patches}${!candidates && !patches ? '<div class="empty">当前知识状态已同步，没有待处理内容。</div>' : ""}</div></section>
+<section class="section"><div class="section-head"><h2>待处理</h2><span>${snapshot.candidates.length + snapshot.patches.length + (status?.fact_patch_pending ?? 0)} 项</span></div><div class="work-list">${candidates}${patches}${factPatches}${!candidates && !patches && !factPatches ? '<div class="empty">当前知识状态已同步，没有待处理内容。</div>' : ""}</div></section>
 <section class="section"><div class="section-head"><h2>最近活动</h2><span>${snapshot.events.length} 条</span></div>${events ? `<ul class="events">${events}</ul>` : '<div class="empty">等待第一次项目变化。</div>'}</section>
-</main><script nonce="${nonce}">const vscode=acquireVsCodeApi();document.addEventListener('click',(event)=>{const target=event.target.closest('button');if(!target)return;if(target.dataset.command)vscode.postMessage({command:target.dataset.command});if(target.dataset.kind==='candidate')vscode.postMessage({command:'openCandidate',id:target.dataset.id});if(target.dataset.kind==='patch')vscode.postMessage({command:'openPatch',id:target.dataset.id});});</script></body></html>`;
+</main><script nonce="${nonce}">const vscode=acquireVsCodeApi();document.addEventListener('click',(event)=>{const target=event.target.closest('button');if(!target)return;if(target.dataset.command)vscode.postMessage({command:target.dataset.command});if(target.dataset.kind==='candidate')vscode.postMessage({command:'openCandidate',id:target.dataset.id});if(target.dataset.kind==='patch')vscode.postMessage({command:'openPatch',id:target.dataset.id});if(target.dataset.kind==='factPatch')vscode.postMessage({command:'openFactPatch',id:target.dataset.id});});</script></body></html>`;
 }
 
 function activityIcon(eventType: string): string {
@@ -1627,6 +1641,14 @@ ${candidate.model_rationale ? `<h2>模型结论</h2><div class="target"><strong>
 <div class="actions"><button onclick="send('draft')">接受并生成草稿</button><button class="secondary" onclick="send('source')">打开来源</button><button class="secondary" onclick="send('ignore')">忽略</button></div>
 <script>const vscode=acquireVsCodeApi();function send(command){vscode.postMessage({command})}</script>
 </body></html>`;
+}
+
+function factPatchStatusOrder(status: FactPatch["status"]): number {
+  return status === "pending" ? 0 : status === "applied" ? 1 : 2;
+}
+
+function factPatchStatusLabel(status: FactPatch["status"]): string {
+  return status === "pending" ? "待应用" : status === "applied" ? "已应用，可撤销" : "已撤销";
 }
 
 function knowledgeOperationLabel(operation: DocumentPatch["operation"] | undefined): string {
