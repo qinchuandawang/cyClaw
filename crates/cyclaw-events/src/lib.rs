@@ -39,6 +39,9 @@ pub enum AgentEventType {
     TaskCheckpointed,
     TaskClosed,
     FactRecorded,
+    FactPatchCreated,
+    FactPatchApplied,
+    FactPatchReverted,
     KnowledgeReconciled,
 }
 

@@ -168,3 +168,15 @@ cyclaw task latest-reconciliation
 ```
 
 当前对账只生成报告和治理建议，不自动改写 `.cyclaw/memory/facts.jsonl`，也不直接应用文档 Patch。中文重复检测采用中文双字切分与相似度阈值；冲突检测属于启发式结果，必须结合来源文件和当前代码人工或由 Codex 审阅。
+
+## 7. Fact Ledger Patch
+
+结构化事实已采用与文档相同的预览、应用和撤销闭环，但 Patch 存储在 `.cyclaw/memory/fact-patches/`。`facts.jsonl` 只能由 `cyclaw-memory` 经 Rust Core 修改，MCP、CLI 和编辑器均不得直接写入。
+
+```text
+preview_fact_patch -> 预览指纹校验 -> apply_fact_patch -> 应用后指纹校验 -> revert_fact_patch
+```
+
+每个 Patch 保存操作、主 Fact ID、参与合并的 Fact ID、修改前/后完整快照、预览和应用指纹、状态及审计事件。`create` 新增 Active Fact；`update` 保持 ID；`merge` 保留主 Fact 并将来源标为 Superseded；`supersede` 保留旧 Fact 并让新 Fact 的 `supersedes` 指向它；`delete` 只标记 Deleted。
+
+新写入的事实证据以 `FactEvidence` 保存路径、可选符号/行范围/内容哈希/Git HEAD、采集与验证时间和证据类型；读取旧 `evidence: Vec<String>` 数据时仍保持兼容。

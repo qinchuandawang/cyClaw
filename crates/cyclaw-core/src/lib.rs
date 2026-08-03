@@ -18,16 +18,19 @@ use cyclaw_knowledge::{
     KnowledgeCandidate, KnowledgeStatus, candidates_from_change_analysis, parse_jsonl, render_jsonl,
 };
 pub use cyclaw_memory::{
-    BeginTaskOptions, FactContext, FailedApproach, ProjectFact, ReconciliationReport,
-    TaskCheckpoint, TaskDecision, TaskRecord,
+    BeginTaskOptions, FactContext, FactEvidence, FactOperation, FactPatch, FactPatchRequest,
+    FailedApproach, ProjectFact, ReconciliationReport, TaskCheckpoint, TaskDecision, TaskRecord,
 };
 use cyclaw_memory::{
-    begin_task as memory_begin_task, checkpoint_task as memory_checkpoint_task,
-    close_task as memory_close_task, compile_fact_context, get_active_task as memory_active_task,
-    get_task as memory_get_task, latest_reconciliation as memory_latest_reconciliation,
-    list_facts as memory_list_facts, list_tasks as memory_list_tasks,
+    apply_fact_patch as memory_apply_fact_patch, begin_task as memory_begin_task,
+    checkpoint_task as memory_checkpoint_task, close_task as memory_close_task,
+    compile_fact_context, get_active_task as memory_active_task, get_task as memory_get_task,
+    latest_reconciliation as memory_latest_reconciliation,
+    list_fact_patches as memory_list_fact_patches, list_facts as memory_list_facts,
+    list_tasks as memory_list_tasks, preview_fact_patch as memory_preview_fact_patch,
     reconcile_knowledge as memory_reconcile_knowledge, record_decision as memory_record_decision,
     record_failed_approach as memory_record_failed_approach,
+    revert_fact_patch as memory_revert_fact_patch,
 };
 use cyclaw_policy::{PermissionLevel, acquire_lock, check_write_path, load_or_default};
 use cyclaw_retrieval::{IndexSummary, SearchResult, build_index, search_index};
@@ -889,6 +892,25 @@ pub fn list_tasks(project_root: &Path, limit: usize) -> Result<Vec<TaskRecord>> 
 
 pub fn list_project_facts(project_root: &Path) -> Result<Vec<ProjectFact>> {
     memory_list_facts(project_root)
+}
+
+/// 预览事实治理变更；MCP、CLI 与编辑器必须经由此入口创建草稿。
+pub fn preview_fact_patch(project_root: &Path, request: FactPatchRequest) -> Result<FactPatch> {
+    memory_preview_fact_patch(project_root, request)
+}
+
+/// 应用已预览的事实草稿，存储层会校验预览期间是否发生并发修改。
+pub fn apply_fact_patch(project_root: &Path, patch_id: &str) -> Result<FactPatch> {
+    memory_apply_fact_patch(project_root, patch_id)
+}
+
+/// 撤销已应用的事实草稿，存储层会校验应用后的内容未被外部修改。
+pub fn revert_fact_patch(project_root: &Path, patch_id: &str) -> Result<FactPatch> {
+    memory_revert_fact_patch(project_root, patch_id)
+}
+
+pub fn list_fact_patches(project_root: &Path) -> Result<Vec<FactPatch>> {
+    memory_list_fact_patches(project_root)
 }
 
 pub fn get_latest_reconciliation(project_root: &Path) -> Result<Option<ReconciliationReport>> {

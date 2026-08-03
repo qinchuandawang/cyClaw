@@ -118,6 +118,9 @@ pub struct ProjectFact {
     pub fact_type: FactType,
     pub status: FactStatus,
     pub evidence: Vec<String>,
+    /// 保留旧版路径数组，并为新写入同步结构化证据。
+    #[serde(default)]
+    pub evidence_details: Vec<FactEvidence>,
     pub source_task_id: Option<String>,
     pub confidence: u8,
     pub valid_from: Option<String>,
@@ -126,6 +129,95 @@ pub struct ProjectFact {
     pub created_at: String,
     pub updated_at: String,
     pub last_verified_at: String,
+}
+
+/// 可定位且可验证的事实证据。旧版 `evidence: Vec<String>` 仍可被读取。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactEvidence {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    pub captured_at: String,
+    pub verified_at: String,
+    pub evidence_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FactOperation {
+    Create,
+    Update,
+    Merge,
+    Supersede,
+    Delete,
+}
+
+impl std::str::FromStr for FactOperation {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "create" => Ok(Self::Create),
+            "update" => Ok(Self::Update),
+            "merge" => Ok(Self::Merge),
+            "supersede" => Ok(Self::Supersede),
+            "delete" => Ok(Self::Delete),
+            _ => anyhow::bail!("未知事实操作: {}", value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FactPatchStatus {
+    Pending,
+    Applied,
+    Reverted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactPatchAuditEvent {
+    pub action: String,
+    pub created_at: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactPatch {
+    pub id: String,
+    pub operation: FactOperation,
+    pub target_fact_id: Option<String>,
+    #[serde(default)]
+    pub source_fact_ids: Vec<String>,
+    pub before: Vec<ProjectFact>,
+    pub after: Vec<ProjectFact>,
+    pub preview_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_fingerprint: Option<String>,
+    pub status: FactPatchStatus,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverted_at: Option<String>,
+    #[serde(default)]
+    pub audit_events: Vec<FactPatchAuditEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FactPatchRequest {
+    pub operation: FactOperation,
+    pub target_fact_id: Option<String>,
+    pub source_fact_ids: Vec<String>,
+    pub fact: Option<ProjectFact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,6 +359,7 @@ pub fn record_decision(
             fact_type: FactType::Decision,
             status: FactStatus::Active,
             evidence: dedupe_strings(evidence),
+            evidence_details: Vec::new(),
             source_task_id: Some(id.clone()),
             confidence: confidence.min(100),
             valid_from: task.git_head.clone(),
@@ -317,6 +410,7 @@ pub fn record_failed_approach(
             fact_type: FactType::FailedApproach,
             status: FactStatus::Active,
             evidence: dedupe_strings(evidence),
+            evidence_details: Vec::new(),
             source_task_id: Some(id.clone()),
             confidence: 95,
             valid_from: task.git_head.clone(),
@@ -409,6 +503,222 @@ pub fn list_facts(project_root: &Path) -> Result<Vec<ProjectFact>> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| Ok(serde_json::from_str::<ProjectFact>(line)?))
         .collect()
+}
+
+pub fn preview_fact_patch(project_root: &Path, request: FactPatchRequest) -> Result<FactPatch> {
+    ensure_memory_dirs(project_root)?;
+    let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
+    let facts = list_facts(project_root)?;
+    let now = Utc::now().to_rfc3339();
+    let target = request
+        .target_fact_id
+        .as_deref()
+        .map(|id| find_fact(&facts, id))
+        .transpose()?;
+    let mut before = target.clone().into_iter().collect::<Vec<_>>();
+    let mut after = Vec::new();
+
+    match request.operation {
+        FactOperation::Create => {
+            let mut fact = request.fact.context("create 必须提供事实内容")?;
+            if fact.id.trim().is_empty() {
+                fact.id = item_id("fact", &fact.statement, &now);
+            }
+            fact.status = FactStatus::Active;
+            normalize_fact(&mut fact, &now);
+            after.push(fact);
+        }
+        FactOperation::Update => {
+            let old = target.context("update 必须指定 target_fact_id")?;
+            let mut fact = request.fact.context("update 必须提供事实内容")?;
+            fact.id = old.id.clone();
+            fact.created_at = old.created_at.clone();
+            normalize_fact(&mut fact, &now);
+            after.push(fact);
+        }
+        FactOperation::Delete => {
+            let mut fact = target.context("delete 必须指定 target_fact_id")?;
+            fact.status = FactStatus::Deleted;
+            fact.updated_at = now.clone();
+            after.push(fact);
+        }
+        FactOperation::Supersede => {
+            let old = target.context("supersede 必须指定 target_fact_id")?;
+            let mut replacement = request.fact.context("supersede 必须提供替代事实")?;
+            if replacement.id.trim().is_empty() {
+                replacement.id = item_id("fact", &replacement.statement, &now);
+            }
+            replacement.status = FactStatus::Active;
+            replacement.supersedes = dedupe_strings(
+                replacement
+                    .supersedes
+                    .into_iter()
+                    .chain([old.id.clone()])
+                    .collect(),
+            );
+            normalize_fact(&mut replacement, &now);
+            let mut old = old;
+            old.status = FactStatus::Superseded;
+            old.updated_at = now.clone();
+            after.extend([old, replacement]);
+        }
+        FactOperation::Merge => {
+            let primary = target.context("merge 必须指定保留的 target_fact_id")?;
+            let sources = request
+                .source_fact_ids
+                .iter()
+                .filter(|id| **id != primary.id)
+                .map(|id| find_fact(&facts, id))
+                .collect::<Result<Vec<_>>>()?;
+            if sources.is_empty() {
+                anyhow::bail!("merge 至少需要一个待合并 source_fact_id");
+            }
+            before.extend(sources.clone());
+            let mut retained = request.fact.unwrap_or(primary.clone());
+            retained.id = primary.id.clone();
+            retained.created_at = primary.created_at.clone();
+            retained.status = FactStatus::Active;
+            retained.supersedes = dedupe_strings(
+                retained
+                    .supersedes
+                    .into_iter()
+                    .chain(sources.iter().map(|fact| fact.id.clone()))
+                    .collect(),
+            );
+            normalize_fact(&mut retained, &now);
+            after.push(retained);
+            for mut source in sources {
+                source.status = FactStatus::Superseded;
+                source.updated_at = now.clone();
+                after.push(source);
+            }
+        }
+    }
+
+    let preview_fingerprint = facts_fingerprint(&before);
+    let id = item_id("fact_patch", &format!("{:?}", request.operation), &now);
+    let patch = FactPatch {
+        id,
+        operation: request.operation,
+        target_fact_id: request.target_fact_id,
+        source_fact_ids: dedupe_strings(request.source_fact_ids),
+        before,
+        after,
+        preview_fingerprint,
+        applied_fingerprint: None,
+        status: FactPatchStatus::Pending,
+        created_at: now.clone(),
+        applied_at: None,
+        reverted_at: None,
+        audit_events: vec![FactPatchAuditEvent {
+            action: "previewed".to_string(),
+            created_at: now,
+            detail: "已生成事实治理预览".to_string(),
+        }],
+    };
+    write_fact_patch(project_root, &patch)?;
+    record_event(
+        project_root,
+        AgentEventType::FactPatchCreated,
+        "生成事实治理草稿",
+        serde_json::json!({"patch_id":patch.id,"operation":patch.operation}),
+    )?;
+    Ok(patch)
+}
+
+pub fn list_fact_patches(project_root: &Path) -> Result<Vec<FactPatch>> {
+    let dir = fact_patches_dir(project_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut patches = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .map(|path| {
+            Ok(serde_json::from_str::<FactPatch>(&fs::read_to_string(
+                path,
+            )?)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    patches.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(patches)
+}
+
+pub fn apply_fact_patch(project_root: &Path, patch_id: &str) -> Result<FactPatch> {
+    ensure_memory_dirs(project_root)?;
+    let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
+    let mut patch = read_fact_patch(project_root, patch_id)?;
+    if patch.status != FactPatchStatus::Pending {
+        anyhow::bail!("事实草稿不是待应用状态: {}", patch_id);
+    }
+    let mut facts = list_facts(project_root)?;
+    let current = facts_for_ids(&facts, patch.before.iter().map(|fact| fact.id.as_str()))?;
+    if facts_fingerprint(&current) != patch.preview_fingerprint {
+        anyhow::bail!("事实在草稿预览后已变化，请重新生成草稿后再应用");
+    }
+    replace_facts(&mut facts, &patch.after);
+    write_facts(project_root, &facts)?;
+    let now = Utc::now().to_rfc3339();
+    patch.applied_fingerprint = Some(facts_fingerprint(&patch.after));
+    patch.status = FactPatchStatus::Applied;
+    patch.applied_at = Some(now.clone());
+    patch.audit_events.push(FactPatchAuditEvent {
+        action: "applied".to_string(),
+        created_at: now,
+        detail: "已应用事实治理草稿".to_string(),
+    });
+    write_fact_patch(project_root, &patch)?;
+    record_event(
+        project_root,
+        AgentEventType::FactPatchApplied,
+        "应用事实治理草稿",
+        serde_json::json!({"patch_id":patch.id,"operation":patch.operation}),
+    )?;
+    Ok(patch)
+}
+
+pub fn revert_fact_patch(project_root: &Path, patch_id: &str) -> Result<FactPatch> {
+    ensure_memory_dirs(project_root)?;
+    let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
+    let mut patch = read_fact_patch(project_root, patch_id)?;
+    if patch.status != FactPatchStatus::Applied {
+        anyhow::bail!("只有已应用的事实草稿可以撤销: {}", patch_id);
+    }
+    let mut facts = list_facts(project_root)?;
+    let current = facts_for_ids(&facts, patch.after.iter().map(|fact| fact.id.as_str()))?;
+    if patch.applied_fingerprint.as_deref() != Some(facts_fingerprint(&current).as_str()) {
+        anyhow::bail!("事实在草稿应用后已变化，拒绝撤销以避免覆盖新内容");
+    }
+    replace_facts(&mut facts, &patch.before);
+    let before_ids = patch
+        .before
+        .iter()
+        .map(|fact| fact.id.as_str())
+        .collect::<HashSet<_>>();
+    let after_only = patch
+        .after
+        .iter()
+        .filter(|fact| !before_ids.contains(fact.id.as_str()))
+        .map(|fact| fact.id.as_str())
+        .collect::<Vec<_>>();
+    facts.retain(|fact| !after_only.contains(&fact.id.as_str()));
+    write_facts(project_root, &facts)?;
+    let now = Utc::now().to_rfc3339();
+    patch.status = FactPatchStatus::Reverted;
+    patch.reverted_at = Some(now.clone());
+    patch.audit_events.push(FactPatchAuditEvent {
+        action: "reverted".to_string(),
+        created_at: now,
+        detail: "已撤销事实治理草稿".to_string(),
+    });
+    write_fact_patch(project_root, &patch)?;
+    record_event(
+        project_root,
+        AgentEventType::FactPatchReverted,
+        "撤销事实治理草稿",
+        serde_json::json!({"patch_id":patch.id,"operation":patch.operation}),
+    )?;
+    Ok(patch)
 }
 
 pub fn compile_fact_context(
@@ -612,7 +922,9 @@ pub fn latest_reconciliation(project_root: &Path) -> Result<Option<Reconciliatio
     Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
 }
 
-fn upsert_fact(project_root: &Path, fact: ProjectFact) -> Result<ProjectFact> {
+fn upsert_fact(project_root: &Path, mut fact: ProjectFact) -> Result<ProjectFact> {
+    let now = Utc::now().to_rfc3339();
+    normalize_fact(&mut fact, &now);
     let mut facts = list_facts(project_root)?;
     if let Some(existing) = facts
         .iter_mut()
@@ -640,6 +952,92 @@ fn write_facts(project_root: &Path, facts: &[ProjectFact]) -> Result<()> {
         .join("\n");
     fs::write(facts_path(project_root), format!("{}\n", content))?;
     Ok(())
+}
+
+fn normalize_fact(fact: &mut ProjectFact, now: &str) {
+    fact.evidence = dedupe_strings(std::mem::take(&mut fact.evidence));
+    if fact.created_at.is_empty() {
+        fact.created_at = now.to_string();
+    }
+    fact.updated_at = now.to_string();
+    if fact.last_verified_at.is_empty() {
+        fact.last_verified_at = now.to_string();
+    }
+    if fact.evidence_details.is_empty() {
+        fact.evidence_details = fact
+            .evidence
+            .iter()
+            .map(|path| FactEvidence {
+                path: path.clone(),
+                symbol: None,
+                line_start: None,
+                line_end: None,
+                content_hash: None,
+                git_head: None,
+                captured_at: now.to_string(),
+                verified_at: now.to_string(),
+                evidence_type: "file".to_string(),
+            })
+            .collect();
+    }
+}
+
+fn find_fact(facts: &[ProjectFact], id: &str) -> Result<ProjectFact> {
+    facts
+        .iter()
+        .find(|fact| fact.id == id)
+        .cloned()
+        .with_context(|| format!("未找到事实: {}", id))
+}
+
+fn facts_for_ids<'a>(
+    facts: &[ProjectFact],
+    ids: impl Iterator<Item = &'a str>,
+) -> Result<Vec<ProjectFact>> {
+    ids.map(|id| find_fact(facts, id)).collect()
+}
+
+fn replace_facts(facts: &mut Vec<ProjectFact>, replacements: &[ProjectFact]) {
+    for replacement in replacements {
+        if let Some(existing) = facts.iter_mut().find(|fact| fact.id == replacement.id) {
+            *existing = replacement.clone();
+        } else {
+            facts.push(replacement.clone());
+        }
+    }
+}
+
+fn facts_fingerprint(facts: &[ProjectFact]) -> String {
+    let mut facts = facts.to_vec();
+    facts.sort_by(|left, right| left.id.cmp(&right.id));
+    format!(
+        "{:016x}",
+        digest(&serde_json::to_string(&facts).unwrap_or_default())
+    )
+}
+
+fn fact_patches_dir(project_root: &Path) -> PathBuf {
+    memory_dir(project_root).join("fact-patches")
+}
+
+fn fact_patch_path(project_root: &Path, patch_id: &str) -> PathBuf {
+    fact_patches_dir(project_root).join(format!("{}.json", patch_id))
+}
+
+fn write_fact_patch(project_root: &Path, patch: &FactPatch) -> Result<()> {
+    fs::create_dir_all(fact_patches_dir(project_root))?;
+    fs::write(
+        fact_patch_path(project_root, &patch.id),
+        serde_json::to_string_pretty(patch)?,
+    )?;
+    Ok(())
+}
+
+fn read_fact_patch(project_root: &Path, patch_id: &str) -> Result<FactPatch> {
+    let path = fact_patch_path(project_root, patch_id);
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("无法读取事实草稿: {}", path.display()))?;
+    Ok(serde_json::from_str(&content)?)
 }
 
 fn finding(
@@ -702,6 +1100,7 @@ fn ensure_memory_dirs(project_root: &Path) -> Result<()> {
     fs::create_dir_all(tasks_dir(project_root))?;
     fs::create_dir_all(memory_dir(project_root))?;
     fs::create_dir_all(reconciliation_dir(project_root))?;
+    fs::create_dir_all(fact_patches_dir(project_root))?;
     Ok(())
 }
 
@@ -832,6 +1231,31 @@ fn record_event(
 mod tests {
     use super::*;
 
+    fn fact(id: &str, statement: &str) -> ProjectFact {
+        let now = "2026-01-01T00:00:00Z".to_string();
+        ProjectFact {
+            id: id.to_string(),
+            statement: statement.to_string(),
+            fact_type: FactType::Constraint,
+            status: FactStatus::Active,
+            evidence: vec!["src/lib.rs".to_string()],
+            evidence_details: Vec::new(),
+            source_task_id: None,
+            confidence: 90,
+            valid_from: None,
+            valid_until: None,
+            supersedes: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_verified_at: now,
+        }
+    }
+
+    fn seed(temp: &tempfile::TempDir, facts: &[ProjectFact]) {
+        ensure_memory_dirs(temp.path()).unwrap();
+        write_facts(temp.path(), facts).unwrap();
+    }
+
     #[test]
     fn task_memory_survives_close_and_new_context() {
         let temp = tempfile::tempdir().unwrap();
@@ -888,5 +1312,157 @@ mod tests {
         let report = reconcile_knowledge(temp.path(), Some(task.id)).unwrap();
         assert!(report.stale_count >= 2);
         assert!(report.duplicate_count >= 1);
+    }
+
+    #[test]
+    fn fact_patch_create_update_and_delete_are_reversible() {
+        let temp = tempfile::tempdir().unwrap();
+        let created = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Create,
+                target_fact_id: None,
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("", "只允许 pnpm")),
+            },
+        )
+        .unwrap();
+        let created = apply_fact_patch(temp.path(), &created.id).unwrap();
+        let id = created.after[0].id.clone();
+        let updated = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Update,
+                target_fact_id: Some(id.clone()),
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("ignored", "只允许 pnpm 11")),
+            },
+        )
+        .unwrap();
+        apply_fact_patch(temp.path(), &updated.id).unwrap();
+        assert_eq!(
+            list_facts(temp.path()).unwrap()[0].statement,
+            "只允许 pnpm 11"
+        );
+        let deleted = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Delete,
+                target_fact_id: Some(id),
+                source_fact_ids: Vec::new(),
+                fact: None,
+            },
+        )
+        .unwrap();
+        let deleted = apply_fact_patch(temp.path(), &deleted.id).unwrap();
+        assert_eq!(
+            list_facts(temp.path()).unwrap()[0].status,
+            FactStatus::Deleted
+        );
+        revert_fact_patch(temp.path(), &deleted.id).unwrap();
+        assert_eq!(
+            list_facts(temp.path()).unwrap()[0].status,
+            FactStatus::Active
+        );
+    }
+
+    #[test]
+    fn fact_patch_merge_and_supersede_preserve_history() {
+        let temp = tempfile::tempdir().unwrap();
+        seed(
+            &temp,
+            &[fact("one", "使用 pnpm"), fact("two", "项目使用 pnpm")],
+        );
+        let merged = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Merge,
+                target_fact_id: Some("one".to_string()),
+                source_fact_ids: vec!["two".to_string()],
+                fact: None,
+            },
+        )
+        .unwrap();
+        apply_fact_patch(temp.path(), &merged.id).unwrap();
+        let facts = list_facts(temp.path()).unwrap();
+        assert_eq!(
+            facts.iter().find(|fact| fact.id == "two").unwrap().status,
+            FactStatus::Superseded
+        );
+        let superseded = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Supersede,
+                target_fact_id: Some("one".to_string()),
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("three", "使用 pnpm 11")),
+            },
+        )
+        .unwrap();
+        apply_fact_patch(temp.path(), &superseded.id).unwrap();
+        let facts = list_facts(temp.path()).unwrap();
+        assert_eq!(
+            facts.iter().find(|fact| fact.id == "one").unwrap().status,
+            FactStatus::Superseded
+        );
+        assert!(
+            facts
+                .iter()
+                .find(|fact| fact.id == "three")
+                .unwrap()
+                .supersedes
+                .contains(&"one".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_rejects_concurrent_fact_change_after_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        seed(&temp, &[fact("one", "旧事实")]);
+        let patch = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Update,
+                target_fact_id: Some("one".to_string()),
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("", "新事实")),
+            },
+        )
+        .unwrap();
+        let mut changed = list_facts(temp.path()).unwrap();
+        changed[0].statement = "外部修改".to_string();
+        write_facts(temp.path(), &changed).unwrap();
+        assert!(
+            apply_fact_patch(temp.path(), &patch.id)
+                .unwrap_err()
+                .to_string()
+                .contains("预览后已变化")
+        );
+    }
+
+    #[test]
+    fn revert_rejects_concurrent_fact_change_after_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        seed(&temp, &[fact("one", "旧事实")]);
+        let patch = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Update,
+                target_fact_id: Some("one".to_string()),
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("", "新事实")),
+            },
+        )
+        .unwrap();
+        apply_fact_patch(temp.path(), &patch.id).unwrap();
+        let mut changed = list_facts(temp.path()).unwrap();
+        changed[0].statement = "外部修改".to_string();
+        write_facts(temp.path(), &changed).unwrap();
+        assert!(
+            revert_fact_patch(temp.path(), &patch.id)
+                .unwrap_err()
+                .to_string()
+                .contains("应用后已变化")
+        );
     }
 }

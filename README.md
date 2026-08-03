@@ -266,6 +266,21 @@ create / update / merge / supersede / delete
 
 当前 resources 覆盖 `.cyclaw/project.md`、`.cyclaw/knowledge-inbox.jsonl`、`.cyclaw/doc-patches/*.json`、`.cyclaw/memory/`、`.cyclaw/tasks/`、`.cyclaw/reconciliation/` 和 `docs/**/*.md`。
 
+### Fact Ledger 治理
+
+结构化事实同样采用 Patch 生命周期，不会由 MCP、CLI 或编辑器直接改写 `facts.jsonl`。先用 `preview_fact_patch` 生成草稿，再用 `apply_fact_patch` 应用；`revert_fact_patch` 仅在应用后的事实仍与草稿指纹一致时恢复，避免覆盖并发修改。`list_fact_patches` 可查看所有审计记录和撤销状态。
+
+支持的事实操作为 `create`、`update`、`merge`、`supersede`、`delete`：合并保留主 Fact 并将重复项标为 `superseded`，取代会保留旧 Fact 并让新 Fact 通过 `supersedes` 建立历史关系，删除只标记为 `deleted`。新事实使用 `FactEvidence` 保存路径、可选符号和行范围、内容哈希、Git 提交、采集/验证时间与证据类型；旧版 `evidence: Vec<String>` 仍可读取。
+
+CLI 示例：
+
+```powershell
+cyclaw fact preview --operation delete --target fact_123 --path <project-path>
+cyclaw fact list --path <project-path>
+cyclaw fact apply fact_patch_123 --path <project-path>
+cyclaw fact revert fact_patch_123 --path <project-path>
+```
+
 ## 任务记忆与上下文
 
 cyClaw 将一次 Coding Agent 工作视为有边界的任务。任务开始时召回相关事实，执行中记录重要决策和失败方案，结束时执行知识对账：

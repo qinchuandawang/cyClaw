@@ -5,16 +5,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use cyclaw_agent::{AgentRunOptions, run_agent_once};
 use cyclaw_core::{
-    BeginTaskOptions, DraftOptions, SearchOptions, apply_document_patch as apply_patch,
+    BeginTaskOptions, DraftOptions, FactOperation, FactPatchRequest, ProjectFact, SearchOptions,
+    apply_document_patch as apply_patch, apply_fact_patch as apply_fact_patch_core,
     begin_task as begin_project_task, checkpoint_task as checkpoint_project_task,
     close_task as close_project_task, generate_document_drafts,
     get_active_task as core_get_active_task,
     get_latest_reconciliation as core_get_latest_reconciliation,
-    get_task_context as core_get_task_context, list_document_patches, list_inbox,
-    list_project_facts as core_list_project_facts, list_tasks as core_list_tasks, project_status,
+    get_task_context as core_get_task_context, list_document_patches,
+    list_fact_patches as core_list_fact_patches, list_inbox,
+    list_project_facts as core_list_project_facts, list_tasks as core_list_tasks,
+    preview_fact_patch as preview_fact_patch_core, project_status,
     reconcile_project_knowledge as core_reconcile_project_knowledge, record_task_decision,
-    record_task_failed_approach, revert_document_patch as revert_patch, search_project,
-    update_inbox_status, watch_project_once,
+    record_task_failed_approach, revert_document_patch as revert_patch,
+    revert_fact_patch as revert_fact_patch_core, search_project, update_inbox_status,
+    watch_project_once,
 };
 use cyclaw_docs::{DocumentPatchStatus, KnowledgeOperation};
 use cyclaw_events::read_events;
@@ -179,6 +183,10 @@ impl McpServer {
             json!({"name":"review_candidate","description":"接受或忽略候选；接受时可用五种知识操作生成草稿。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"})),("action",json!({"type":"string","enum":["accept","ignore"]})),("generate_draft",json!({"type":"boolean"})),("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("selector",json!({"type":"string"})),("source_selectors",json!({"type":"array","items":{"type":"string"}})),("replacement_content",json!({"type":"string"})),("delete_target_document",json!({"type":"boolean"}))])}),
             json!({"name":"apply_document_patch","description":"应用指定文档草稿，受文档写入权限约束。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
             json!({"name":"revert_document_patch","description":"撤销已应用的文档草稿，恢复原始内容。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
+            json!({"name":"list_fact_patches","description":"列出结构化事实治理草稿及其应用、撤销状态。","inputSchema":object_schema(vec![])}),
+            json!({"name":"preview_fact_patch","description":"预览结构化事实的 create/update/merge/supersede/delete 操作，生成可审计且可撤销的草稿，不修改 Fact Ledger。","inputSchema":object_schema(vec![("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("target_fact_id",json!({"type":"string"})),("source_fact_ids",json!({"type":"array","items":{"type":"string"}})),("fact",json!({"type":"object","description":"create、update、supersede 的完整事实快照；merge 时可选，用于更新主事实。"}))])}),
+            json!({"name":"apply_fact_patch","description":"应用指定事实治理草稿，应用前校验事实预览指纹。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
+            json!({"name":"revert_fact_patch","description":"撤销指定已应用事实草稿；仅在应用后事实未变化时执行。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
             json!({"name":"run_agent","description":"运行一次 cyClaw Agent，可选择是否调用活动模型。","inputSchema":object_schema(vec![("use_model",json!({"type":"boolean"})),("provider",json!({"type":"string"}))])}),
             json!({"name":"set_runtime_strategy","description":"设置观察、审阅、智能审阅或自动文档策略。","inputSchema":object_schema(vec![("strategy",json!({"type":"string","enum":["observe","review","smart","auto"]})),("auto_apply_min_confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
             json!({"name":"doctor","description":"诊断 Git、配置、模型、权限、知识目录和文档写入状态。","inputSchema":object_schema(vec![])}),
@@ -201,7 +209,11 @@ impl McpServer {
             let write = is_write_tool(name);
             let destructive = matches!(
                 name,
-                "apply_document_patch" | "revert_document_patch" | "set_runtime_strategy"
+                "apply_document_patch"
+                    | "revert_document_patch"
+                    | "apply_fact_patch"
+                    | "revert_fact_patch"
+                    | "set_runtime_strategy"
             );
             let idempotent = matches!(
                 name,
@@ -255,6 +267,10 @@ impl McpServer {
             "review_candidate" => self.review_candidate(arguments)?,
             "apply_document_patch" => self.apply_document_patch(arguments)?,
             "revert_document_patch" => self.revert_document_patch(arguments)?,
+            "list_fact_patches" => self.list_fact_patches()?,
+            "preview_fact_patch" => self.preview_fact_patch(arguments)?,
+            "apply_fact_patch" => self.apply_fact_patch(arguments)?,
+            "revert_fact_patch" => self.revert_fact_patch(arguments)?,
             "run_agent" => self.run_agent(arguments)?,
             "set_runtime_strategy" => self.set_runtime_strategy(arguments)?,
             "doctor" => self.doctor()?,
@@ -584,6 +600,44 @@ impl McpServer {
             "target_doc": relative_path(&self.project_root, &result.target_doc_path),
             "reverted": true
         }))
+    }
+
+    fn list_fact_patches(&self) -> Result<Value> {
+        Ok(json!({"patches": core_list_fact_patches(&self.project_root)?}))
+    }
+
+    fn preview_fact_patch(&self, arguments: Value) -> Result<Value> {
+        let operation = required_string(&arguments, "operation")?.parse::<FactOperation>()?;
+        let fact = arguments
+            .get("fact")
+            .cloned()
+            .map(serde_json::from_value::<ProjectFact>)
+            .transpose()?;
+        let patch = preview_fact_patch_core(
+            &self.project_root,
+            FactPatchRequest {
+                operation,
+                target_fact_id: arguments
+                    .get("target_fact_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                source_fact_ids: optional_string_array(&arguments, "source_fact_ids")?,
+                fact,
+            },
+        )?;
+        Ok(json!({"patch":patch,"ledger_modified":false,"revert_available":false}))
+    }
+
+    fn apply_fact_patch(&self, arguments: Value) -> Result<Value> {
+        let patch =
+            apply_fact_patch_core(&self.project_root, required_string(&arguments, "patch_id")?)?;
+        Ok(json!({"patch":patch,"revert_available":true}))
+    }
+
+    fn revert_fact_patch(&self, arguments: Value) -> Result<Value> {
+        let patch =
+            revert_fact_patch_core(&self.project_root, required_string(&arguments, "patch_id")?)?;
+        Ok(json!({"patch":patch,"reverted":true}))
     }
 
     fn run_agent(&self, arguments: Value) -> Result<Value> {
@@ -983,6 +1037,9 @@ fn is_write_tool(name: &str) -> bool {
             | "review_candidate"
             | "apply_document_patch"
             | "revert_document_patch"
+            | "preview_fact_patch"
+            | "apply_fact_patch"
+            | "revert_fact_patch"
             | "run_agent"
             | "set_runtime_strategy"
             | "begin_task"
@@ -1185,6 +1242,21 @@ mod tests {
             .unwrap();
 
         assert!(context.to_string().contains("不得重新进入处理中"));
+    }
+
+    #[test]
+    fn fact_patch_protocol_previews_applies_and_reverts() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(temp.path().to_path_buf());
+        let preview = server.preview_fact_patch(json!({
+            "operation":"create",
+            "fact":{"id":"","statement":"测试事实","fact_type":"constraint","status":"active","evidence":["src/lib.rs"],"confidence":90,"supersedes":[],"created_at":"","updated_at":"","last_verified_at":""}
+        })).unwrap();
+        let id = preview["patch"]["id"].as_str().unwrap();
+        let applied = server.apply_fact_patch(json!({"patch_id":id})).unwrap();
+        assert_eq!(applied["patch"]["status"], "applied");
+        let reverted = server.revert_fact_patch(json!({"patch_id":id})).unwrap();
+        assert_eq!(reverted["patch"]["status"], "reverted");
     }
 
     fn framed(value: Value) -> String {

@@ -7,6 +7,9 @@ type McpToolName =
   | "get_project_status"
   | "list_pending_knowledge"
   | "list_document_patches"
+  | "list_fact_patches"
+  | "apply_fact_patch"
+  | "revert_fact_patch"
   | "get_policy"
   | "get_model_providers"
   | "list_events"
@@ -52,6 +55,17 @@ interface DocumentPatch {
   original_content: string;
   proposed_content: string;
   preview: string;
+}
+
+interface FactPatch {
+  id: string;
+  operation: "create" | "update" | "merge" | "supersede" | "delete";
+  target_fact_id?: string;
+  source_fact_ids: string[];
+  before: Array<{ id: string; statement: string; status: string }>;
+  after: Array<{ id: string; statement: string; status: string }>;
+  preview_fingerprint: string;
+  status: "pending" | "applied" | "reverted";
 }
 
 interface AgentEvent {
@@ -107,6 +121,7 @@ interface KnowledgeSnapshot {
   status?: ProjectStatus;
   candidates: KnowledgeCandidate[];
   patches: DocumentPatch[];
+  factPatches: FactPatch[];
   policy?: PolicySnapshot;
   models?: ModelProvidersSnapshot;
   events: AgentEvent[];
@@ -154,7 +169,7 @@ class CyclawTreeItem extends vscode.TreeItem {
   constructor(
     label: string,
     collapsibleState: vscode.TreeItemCollapsibleState,
-    public readonly kind: "section" | "leaf" | "candidate" | "patch" | "permission" = "leaf",
+    public readonly kind: "section" | "leaf" | "candidate" | "patch" | "factPatch" | "permission" = "leaf",
     public readonly id?: string,
     public readonly children: CyclawTreeItem[] = [],
     public readonly permissionAction?: PermissionAction
@@ -166,7 +181,7 @@ class CyclawTreeItem extends vscode.TreeItem {
 class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem> {
   private readonly changed = new vscode.EventEmitter<CyclawTreeItem | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
-  private snapshot: KnowledgeSnapshot = { candidates: [], patches: [], events: [] };
+  private snapshot: KnowledgeSnapshot = { candidates: [], patches: [], factPatches: [], events: [] };
   private dashboard?: CyclawDashboardProvider;
 
   attachDashboard(dashboard: CyclawDashboardProvider): void {
@@ -184,6 +199,10 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
 
   getPatch(id: string): DocumentPatch | undefined {
     return this.snapshot.patches.find((patch) => patch.id === id);
+  }
+
+  getFactPatch(id: string): FactPatch | undefined {
+    return this.snapshot.factPatches.find((patch) => patch.id === id);
   }
 
   refresh(snapshot: KnowledgeSnapshot): void {
@@ -227,6 +246,7 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
       this.permissionSection(),
       this.pendingSection(),
       this.patchesSection(),
+      this.factPatchesSection(),
       this.nextStepsSection()
     ];
   }
@@ -449,6 +469,18 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
     return section;
   }
 
+  private factPatchesSection(): CyclawTreeItem {
+    const children = this.snapshot.factPatches.length ? this.snapshot.factPatches.map((patch) => {
+      const item = leaf(`${knowledgeOperationLabel(patch.operation)} · ${patch.status}`, "database", "factPatch", patch.id);
+      item.contextValue = "cyclawFactPatch";
+      item.description = patch.target_fact_id ?? patch.after[0]?.id ?? "新事实";
+      item.tooltip = `ID: ${patch.id}\n操作: ${knowledgeOperationLabel(patch.operation)}\n状态: ${patch.status}\n预览指纹: ${patch.preview_fingerprint}`;
+      item.command = { command: "cyclaw.openFactPatch", title: "预览事实草稿", arguments: [item] };
+      return item;
+    }) : [leaf("暂无事实治理草稿", "pass")];
+    return new CyclawTreeItem("事实治理草稿", vscode.TreeItemCollapsibleState.Collapsed, "section", undefined, children);
+  }
+
   private nextStepsSection(): CyclawTreeItem {
     const steps = this.snapshot.status?.suggested_next_steps ?? [];
     const children = steps.length
@@ -467,7 +499,7 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
 
 class CyclawDashboardProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
-  private snapshot: KnowledgeSnapshot = { candidates: [], patches: [], events: [] };
+  private snapshot: KnowledgeSnapshot = { candidates: [], patches: [], factPatches: [], events: [] };
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -576,6 +608,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("cyclaw.openPatchById", (id: string) =>
       openPatch(new CyclawTreeItem("文档草稿", vscode.TreeItemCollapsibleState.None, "patch", id), provider)
     ),
+    vscode.commands.registerCommand("cyclaw.openFactPatch", (item: CyclawTreeItem) => openFactPatch(item, provider)),
     vscode.commands.registerCommand("cyclaw.configureModel", () => configureModel(provider)),
     vscode.commands.registerCommand("cyclaw.switchModel", () => switchModel(provider)),
     vscode.commands.registerCommand("cyclaw.configurePermissions", () => configurePermissions(provider)),
@@ -671,6 +704,20 @@ async function openPatch(
     `cyClaw ${knowledgeOperationLabel(patch.operation)} · ${patch.target_doc}`,
     { preview: true }
   );
+}
+
+async function openFactPatch(item: CyclawTreeItem | undefined, provider: CyclawKnowledgeProvider): Promise<void> {
+  if (!item?.id || item.kind !== "factPatch") return;
+  const root = workspaceRoot();
+  const patch = provider.getFactPatch(item.id);
+  if (!root || !patch) return;
+  const action = patch.status === "pending" ? "应用" : patch.status === "applied" ? "撤销" : undefined;
+  const choice = action
+    ? await vscode.window.showInformationMessage(`${knowledgeOperationLabel(patch.operation)}：${patch.before.map((fact) => fact.statement).join("；") || "新增"} -> ${patch.after.map((fact) => fact.statement).join("；")}`, action)
+    : await vscode.window.showInformationMessage("该事实草稿已撤销。");
+  if (choice === "应用") await callMcpTool("apply_fact_patch", root, { patch_id: patch.id });
+  if (choice === "撤销") await callMcpTool("revert_fact_patch", root, { patch_id: patch.id });
+  await refresh(provider);
 }
 
 async function beginTask(provider: CyclawKnowledgeProvider): Promise<void> {
@@ -1092,11 +1139,11 @@ export function deactivate(): void {
 async function bootstrapWorkspace(provider: CyclawKnowledgeProvider): Promise<void> {
   const root = workspaceRoot();
   if (!root) {
-    provider.refresh({ candidates: [], patches: [], events: [], error: "未打开工作区" });
+    provider.refresh({ candidates: [], patches: [], factPatches: [], events: [], error: "未打开工作区" });
     return;
   }
   if (!vscode.workspace.isTrusted) {
-    provider.refresh({ candidates: [], patches: [], events: [], error: "工作区未受信任，cyClaw 不会启动 CLI 或读取项目文件。" });
+    provider.refresh({ candidates: [], patches: [], factPatches: [], events: [], error: "工作区未受信任，cyClaw 不会启动 CLI 或读取项目文件。" });
     statusBarItem.text = "$(shield) cyClaw 等待工作区信任";
     return;
   }
@@ -1116,7 +1163,7 @@ async function bootstrapWorkspace(provider: CyclawKnowledgeProvider): Promise<vo
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     outputChannel.appendLine(`cyClaw 自动启动失败: ${message}`);
-    provider.refresh({ candidates: [], patches: [], events: [], error: message });
+    provider.refresh({ candidates: [], patches: [], factPatches: [], events: [], error: message });
   }
 }
 
@@ -1126,6 +1173,7 @@ async function refresh(provider: CyclawKnowledgeProvider): Promise<void> {
     provider.refresh({
       candidates: [],
       patches: [],
+      factPatches: [],
       events: [],
       error: "未打开工作区"
     });
@@ -1133,10 +1181,11 @@ async function refresh(provider: CyclawKnowledgeProvider): Promise<void> {
   }
 
   try {
-    const [status, pending, patches, policy, models, events, active, reconciliation] = await Promise.all([
+    const [status, pending, patches, factPatches, policy, models, events, active, reconciliation] = await Promise.all([
       callMcpTool<ProjectStatus>("get_project_status", root),
       callMcpTool<{ candidates: KnowledgeCandidate[] }>("list_pending_knowledge", root),
       callMcpTool<{ patches: DocumentPatch[] }>("list_document_patches", root),
+      callMcpTool<{ patches: FactPatch[] }>("list_fact_patches", root),
       callMcpTool<PolicySnapshot>("get_policy", root),
       callMcpTool<ModelProvidersSnapshot>("get_model_providers", root),
       callMcpTool<{ events: AgentEvent[] }>("list_events", root, { limit: 12 }),
@@ -1155,6 +1204,7 @@ async function refresh(provider: CyclawKnowledgeProvider): Promise<void> {
       status,
       candidates: pending.candidates,
       patches: patches.patches,
+      factPatches: factPatches.patches,
       policy,
       models,
       events: events.events,
@@ -1172,6 +1222,7 @@ async function refresh(provider: CyclawKnowledgeProvider): Promise<void> {
     provider.refresh({
       candidates: [],
       patches: [],
+      factPatches: [],
       events: [],
       error: error instanceof Error ? error.message : String(error)
     });
@@ -1451,7 +1502,7 @@ function parseFrames(output: string): Array<Record<string, any>> {
 function leaf(
   label: string,
   icon: string,
-  kind: "leaf" | "candidate" | "patch" | "permission" = "leaf",
+  kind: "leaf" | "candidate" | "patch" | "factPatch" | "permission" = "leaf",
   id?: string
 ): CyclawTreeItem {
   const item = new CyclawTreeItem(label, vscode.TreeItemCollapsibleState.None, kind, id);

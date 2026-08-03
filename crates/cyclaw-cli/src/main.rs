@@ -9,13 +9,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use cyclaw_agent::{AgentRunOptions, cleanup_agent_runs, list_agent_runs, run_agent_once};
 use cyclaw_core::{
-    BeginTaskOptions, DiffOptions, DraftOptions, InboxGenerateOptions, InitOptions, ScanOptions,
-    SearchOptions, analyze_project_diff, apply_document_patch, begin_task, checkpoint_task,
+    BeginTaskOptions, DiffOptions, DraftOptions, FactOperation, FactPatchRequest,
+    InboxGenerateOptions, InitOptions, ProjectFact, ScanOptions, SearchOptions,
+    analyze_project_diff, apply_document_patch, apply_fact_patch, begin_task, checkpoint_task,
     close_task, current_change_snapshot, generate_document_drafts, generate_inbox, get_active_task,
     get_latest_reconciliation, get_task_context, index_project, init_project,
-    list_document_patches, list_inbox, list_project_facts, list_tasks, project_status,
-    reconcile_project_knowledge, record_task_decision, record_task_failed_approach,
-    revert_document_patch, scan_project, search_project, update_inbox_status, watch_project_once,
+    list_document_patches, list_fact_patches, list_inbox, list_project_facts, list_tasks,
+    preview_fact_patch, project_status, reconcile_project_knowledge, record_task_decision,
+    record_task_failed_approach, revert_document_patch, revert_fact_patch, scan_project,
+    search_project, update_inbox_status, watch_project_once,
 };
 use cyclaw_docs::KnowledgeOperation;
 use cyclaw_knowledge::{KnowledgeImportance, KnowledgeStatus};
@@ -88,6 +90,11 @@ enum Commands {
     Draft {
         #[command(subcommand)]
         command: DraftCommand,
+    },
+    /// 管理结构化 Fact Ledger 草稿
+    Fact {
+        #[command(subcommand)]
+        command: FactCommand,
     },
     /// 构建本地知识索引
     Index {
@@ -230,6 +237,41 @@ enum DraftCommand {
         /// 文档草稿 ID
         id: String,
         /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FactCommand {
+    /// 预览 create/update/merge/supersede/delete 事实操作
+    Preview {
+        #[arg(long)]
+        operation: String,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        /// 完整 ProjectFact JSON 文件；create/update/supersede 必填，merge 可选
+        #[arg(long)]
+        fact_file: Option<PathBuf>,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 查看事实治理草稿
+    List {
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 应用事实治理草稿
+    Apply {
+        id: String,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 撤销已应用的事实治理草稿
+    Revert {
+        id: String,
         #[arg(short, long)]
         path: Option<PathBuf>,
     },
@@ -706,6 +748,50 @@ fn main() -> Result<()> {
                     update_inbox_status(resolve_path(path)?, &id, KnowledgeStatus::Ignored)?;
                 println!("已忽略候选知识: {}", result.candidate.id);
                 println!("知识收件箱: {}", result.inbox_path.display());
+            }
+        },
+        Commands::Fact { command } => match command {
+            FactCommand::Preview {
+                operation,
+                target,
+                sources,
+                fact_file,
+                path,
+            } => {
+                let fact = match fact_file {
+                    Some(file) => Some(serde_json::from_str::<ProjectFact>(&fs::read_to_string(
+                        file,
+                    )?)?),
+                    None => None,
+                };
+                let patch = preview_fact_patch(
+                    &resolve_path(path)?,
+                    FactPatchRequest {
+                        operation: operation.parse::<FactOperation>()?,
+                        target_fact_id: target,
+                        source_fact_ids: sources,
+                        fact,
+                    },
+                )?;
+                println!("事实草稿: {}", patch.id);
+                println!("操作: {:?}", patch.operation);
+                println!("预览指纹: {}", patch.preview_fingerprint);
+            }
+            FactCommand::List { path } => {
+                for patch in list_fact_patches(&resolve_path(path)?)? {
+                    println!("{} {:?} {:?}", patch.id, patch.operation, patch.status);
+                }
+            }
+            FactCommand::Apply { id, path } => {
+                let patch = apply_fact_patch(&resolve_path(path)?, &id)?;
+                println!(
+                    "已应用事实草稿: {}；可使用 `cyclaw fact revert {}` 撤销",
+                    patch.id, patch.id
+                );
+            }
+            FactCommand::Revert { id, path } => {
+                let patch = revert_fact_patch(&resolve_path(path)?, &id)?;
+                println!("已撤销事实草稿: {}", patch.id);
             }
         },
         Commands::Draft { command } => match command {
