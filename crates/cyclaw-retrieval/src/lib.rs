@@ -123,12 +123,28 @@ pub fn search_index(index_path: &Path, query: &str, limit: usize) -> Result<Vec<
     initialize_schema(&connection)?;
 
     let limit = limit.max(1);
-    let mut results = search_with_fts(&connection, query, limit)?;
+    let fts_query = literal_fts_query(query);
+    let mut results = if fts_query.is_empty() {
+        Vec::new()
+    } else {
+        match search_with_fts(&connection, &fts_query, limit) {
+            Ok(results) => results,
+            Err(error) if is_fts_query_error(&error) => Vec::new(),
+            Err(error) => return Err(error),
+        }
+    };
     if results.is_empty() {
         results = search_with_like(&connection, query, limit)?;
     }
 
     Ok(results)
+}
+
+fn is_fts_query_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("fts5: syntax error")
+        || message.contains("unterminated string")
+        || message.contains("no such column")
 }
 
 fn search_with_fts(
@@ -170,12 +186,14 @@ fn search_with_like(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    let pattern = format!("%{}%", query);
+    let pattern = format!("%{}%", escape_like(query));
     let mut statement = connection.prepare(
         r#"
         SELECT source_type, path, title, content
         FROM documents
-        WHERE title LIKE ?1 OR content LIKE ?1 OR path LIKE ?1
+        WHERE title LIKE ?1 ESCAPE '\'
+           OR content LIKE ?1 ESCAPE '\'
+           OR path LIKE ?1 ESCAPE '\'
         ORDER BY id
         LIMIT ?2
         "#,
@@ -197,6 +215,33 @@ fn search_with_like(
     }
 
     Ok(results)
+}
+
+fn literal_fts_query(query: &str) -> String {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for character in query.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            current.push(character);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    terms
+        .into_iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn escape_like(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn build_like_snippet(content: &str, query: &str) -> String {
@@ -458,5 +503,24 @@ mod tests {
         assert_eq!(summary.document_count, 1);
         assert_eq!(search_index(&index_path, "gamma", 10).unwrap().len(), 1);
         assert!(search_index(&index_path, "beta", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn special_characters_are_searched_as_literals() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("docs")).unwrap();
+        fs::write(
+            temp.path().join("docs/query.md"),
+            "# 查询安全\n\nSHA-256 用于 api:v1（中文）内容哈希。",
+        )
+        .unwrap();
+        let index_path = temp.path().join(".cyclaw/index.sqlite");
+        build_index(temp.path(), &index_path).unwrap();
+
+        for query in ["SHA-256", "api:v1", "（中文）", "SHA-256 中文"] {
+            let results = search_index(&index_path, query, 10).unwrap();
+            assert_eq!(results.len(), 1, "查询未命中文档: {query}");
+        }
+        assert!(search_index(&index_path, "*:()", 10).unwrap().is_empty());
     }
 }

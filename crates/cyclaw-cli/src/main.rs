@@ -10,12 +10,13 @@ use clap::{Parser, Subcommand};
 use cyclaw_agent::{AgentRunOptions, cleanup_agent_runs, list_agent_runs, run_agent_once};
 use cyclaw_core::{
     BeginTaskOptions, DiffOptions, DraftOptions, FactInput, FactOperation, FactPatch,
-    FactPatchRequest, FactType, InboxGenerateOptions, InitOptions, ProjectFact, ScanOptions,
-    SearchOptions, analyze_project_diff, apply_document_patch, apply_fact_patch, begin_task,
-    checkpoint_task, close_task, current_change_snapshot, generate_document_drafts, generate_inbox,
-    get_active_task, get_latest_reconciliation, get_task_context, index_project, init_project,
-    list_document_patches, list_fact_patches, list_inbox, list_project_facts, list_tasks,
-    preview_fact_patch, project_fact_from_input, project_status, reconcile_project_knowledge,
+    FactPatchQuery, FactPatchRequest, FactPatchStatus, FactType, InboxGenerateOptions, InitOptions,
+    ProjectFact, ScanOptions, SearchOptions, analyze_project_diff, apply_document_patch,
+    apply_fact_patch, begin_task, checkpoint_task, close_task, current_change_snapshot,
+    generate_document_drafts, generate_inbox, get_active_task, get_latest_reconciliation,
+    get_task_context, index_project, init_project, list_document_patches,
+    list_evidence_verifications, list_inbox, list_project_facts, list_tasks, preview_fact_patch,
+    project_fact_from_input, project_status, query_fact_patches, reconcile_project_knowledge,
     record_task_decision, record_task_failed_approach, revert_document_patch, revert_fact_patch,
     scan_project, search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
 };
@@ -331,6 +332,25 @@ enum FactCommand {
     },
     /// 查看事实治理草稿
     List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        operation: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 查看独立证据验证账本
+    Verifications {
+        #[arg(long)]
+        fact_id: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
         #[arg(short, long)]
         path: Option<PathBuf>,
     },
@@ -984,9 +1004,50 @@ fn main() -> Result<()> {
                 println!("操作: {:?}", patch.operation);
                 println!("预览指纹: {}", patch.preview_fingerprint);
             }
-            FactCommand::List { path } => {
-                for patch in list_fact_patches(&resolve_path(path)?)? {
+            FactCommand::List {
+                status,
+                operation,
+                offset,
+                limit,
+                path,
+            } => {
+                let page = query_fact_patches(
+                    &resolve_path(path)?,
+                    FactPatchQuery {
+                        status: status
+                            .map(|value| value.parse::<FactPatchStatus>())
+                            .transpose()?,
+                        operation: operation
+                            .map(|value| value.parse::<FactOperation>())
+                            .transpose()?,
+                        offset,
+                        limit,
+                    },
+                )?;
+                println!("事实草稿总数: {}", page.total);
+                for patch in page.patches {
                     println!("{} {:?} {:?}", patch.id, patch.operation, patch.status);
+                }
+            }
+            FactCommand::Verifications {
+                fact_id,
+                offset,
+                limit,
+                path,
+            } => {
+                for record in list_evidence_verifications(
+                    &resolve_path(path)?,
+                    fact_id.as_deref(),
+                    offset,
+                    limit,
+                )? {
+                    println!(
+                        "{} {} 已验证={} 问题={}",
+                        record.checked_at,
+                        record.fact_id,
+                        record.verified_count,
+                        record.issue_count
+                    );
                 }
             }
             FactCommand::Apply { id, path } => {

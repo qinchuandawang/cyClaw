@@ -68,7 +68,7 @@ interface FactPatch {
   before: Array<{ id: string; statement: string; status: string }>;
   after: Array<{ id: string; statement: string; status: string }>;
   preview_fingerprint: string;
-  status: "pending" | "applied" | "reverted";
+  status: "pending" | "applying" | "applied" | "reverting" | "reverted";
 }
 
 interface AgentEvent {
@@ -719,10 +719,25 @@ async function openFactPatch(item: CyclawTreeItem | undefined, provider: CyclawK
   const root = workspaceRoot();
   const patch = provider.getFactPatch(item.id);
   if (!root || !patch) return;
+  const before = await vscode.workspace.openTextDocument({
+    content: JSON.stringify({ operation: patch.operation, facts: patch.before }, null, 2),
+    language: "json"
+  });
+  const after = await vscode.workspace.openTextDocument({
+    content: JSON.stringify({ operation: patch.operation, facts: patch.after }, null, 2),
+    language: "json"
+  });
+  await vscode.commands.executeCommand(
+    "vscode.diff",
+    before.uri,
+    after.uri,
+    `cyClaw ${knowledgeOperationLabel(patch.operation)} · ${patch.target_fact_id ?? patch.after[0]?.id ?? "新事实"}`,
+    { preview: true }
+  );
   const action = patch.status === "pending" ? "应用" : patch.status === "applied" ? "撤销" : undefined;
   const choice = action
     ? await vscode.window.showInformationMessage(`${knowledgeOperationLabel(patch.operation)}：${patch.before.map((fact) => fact.statement).join("；") || "新增"} -> ${patch.after.map((fact) => fact.statement).join("；")}`, action)
-    : await vscode.window.showInformationMessage("该事实草稿已撤销。");
+    : await vscode.window.showInformationMessage(`事实草稿状态：${factPatchStatusLabel(patch.status)}`);
   if (choice === "应用") await callMcpTool("apply_fact_patch", root, { patch_id: patch.id });
   if (choice === "撤销") await callMcpTool("revert_fact_patch", root, { patch_id: patch.id });
   await refresh(provider);
@@ -1193,7 +1208,7 @@ async function refresh(provider: CyclawKnowledgeProvider): Promise<void> {
       callMcpTool<ProjectStatus>("get_project_status", root),
       callMcpTool<{ candidates: KnowledgeCandidate[] }>("list_pending_knowledge", root),
       callMcpTool<{ patches: DocumentPatch[] }>("list_document_patches", root),
-      callMcpTool<{ patches: FactPatch[] }>("list_fact_patches", root),
+      callMcpTool<{ patches: FactPatch[] }>("list_fact_patches", root, { limit: 100 }),
       callMcpTool<PolicySnapshot>("get_policy", root),
       callMcpTool<ModelProvidersSnapshot>("get_model_providers", root),
       callMcpTool<{ events: AgentEvent[] }>("list_events", root, { limit: 12 }),
@@ -1644,10 +1659,13 @@ ${candidate.model_rationale ? `<h2>模型结论</h2><div class="target"><strong>
 }
 
 function factPatchStatusOrder(status: FactPatch["status"]): number {
-  return status === "pending" ? 0 : status === "applied" ? 1 : 2;
+  if (status === "applying" || status === "reverting") return 0;
+  return status === "pending" ? 1 : status === "applied" ? 2 : 3;
 }
 
 function factPatchStatusLabel(status: FactPatch["status"]): string {
+  if (status === "applying") return "应用恢复中";
+  if (status === "reverting") return "撤销恢复中";
   return status === "pending" ? "待应用" : status === "applied" ? "已应用，可撤销" : "已撤销";
 }
 

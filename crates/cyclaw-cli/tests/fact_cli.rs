@@ -46,6 +46,19 @@ fn previews_applies_and_reverts_fact_through_real_cli() {
         .expect("事实应为合法 JSON");
     assert_eq!(fact["status"], "active");
     assert_eq!(fact["evidence_details"][0]["path"], "src/main.rs");
+    let fact_id = fact["id"].as_str().unwrap();
+
+    let listed = run(
+        temp.path(),
+        &["fact", "list", "--status", "applied", "--limit", "1"],
+    );
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(&id));
+    run(temp.path(), &["fact", "verify", fact_id]);
+    let verifications = run(
+        temp.path(),
+        &["fact", "verifications", "--fact-id", fact_id],
+    );
+    assert!(String::from_utf8_lossy(&verifications.stdout).contains(fact_id));
 
     run(temp.path(), &["fact", "revert", &id]);
     let facts = std::fs::read_to_string(temp.path().join(".cyclaw/memory/facts.jsonl"))

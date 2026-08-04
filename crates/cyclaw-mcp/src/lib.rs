@@ -5,20 +5,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use cyclaw_agent::{AgentRunOptions, run_agent_once};
 use cyclaw_core::{
-    BeginTaskOptions, DraftOptions, FactEvidence, FactInput, FactOperation, FactPatchRequest,
-    FactType, ProjectFact, SearchOptions, apply_document_patch as apply_patch,
-    apply_fact_patch as apply_fact_patch_core, begin_task as begin_project_task,
-    checkpoint_task as checkpoint_project_task, close_task as close_project_task,
-    generate_document_drafts, get_active_task as core_get_active_task,
+    BeginTaskOptions, DraftOptions, FactEvidence, FactInput, FactOperation, FactPatchQuery,
+    FactPatchRequest, FactPatchStatus, FactType, ProjectFact, SearchOptions,
+    apply_document_patch as apply_patch, apply_fact_patch as apply_fact_patch_core,
+    begin_task as begin_project_task, checkpoint_task as checkpoint_project_task,
+    close_task as close_project_task, generate_document_drafts,
+    get_active_task as core_get_active_task,
     get_latest_reconciliation as core_get_latest_reconciliation,
     get_task_context as core_get_task_context, list_document_patches,
-    list_fact_patches as core_list_fact_patches, list_inbox,
+    list_evidence_verifications as core_list_evidence_verifications, list_inbox,
     list_project_facts as core_list_project_facts, list_tasks as core_list_tasks,
     preview_fact_patch as preview_fact_patch_core, project_fact_from_input, project_status,
+    query_fact_patches as core_query_fact_patches,
     reconcile_project_knowledge as core_reconcile_project_knowledge, record_task_decision,
-    record_task_failed_approach, revert_document_patch as revert_patch,
-    revert_fact_patch as revert_fact_patch_core, search_project, update_inbox_status,
-    verify_fact_evidence as verify_fact_evidence_core, watch_project_once,
+    record_task_failed_approach, recover_fact_patch_transactions as recover_fact_transactions,
+    revert_document_patch as revert_patch, revert_fact_patch as revert_fact_patch_core,
+    search_project, update_inbox_status, verify_fact_evidence as verify_fact_evidence_core,
+    watch_project_once,
 };
 use cyclaw_docs::{DocumentPatchStatus, KnowledgeOperation};
 use cyclaw_events::read_events;
@@ -51,6 +54,7 @@ where
     W: Write,
 {
     let mut transport = McpTransport::new(reader);
+    recover_fact_transactions(&options.project_root)?;
     let server = McpServer::new(options.project_root);
 
     while let Some(request) = transport.next_message()? {
@@ -183,11 +187,12 @@ impl McpServer {
             json!({"name":"review_candidate","description":"接受或忽略候选；接受时可用五种知识操作生成草稿。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"})),("action",json!({"type":"string","enum":["accept","ignore"]})),("generate_draft",json!({"type":"boolean"})),("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("selector",json!({"type":"string"})),("source_selectors",json!({"type":"array","items":{"type":"string"}})),("replacement_content",json!({"type":"string"})),("delete_target_document",json!({"type":"boolean"}))])}),
             json!({"name":"apply_document_patch","description":"应用指定文档草稿，受文档写入权限约束。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
             json!({"name":"revert_document_patch","description":"撤销已应用的文档草稿，恢复原始内容。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
-            json!({"name":"list_fact_patches","description":"列出结构化事实治理草稿及其应用、撤销状态。","inputSchema":object_schema(vec![])}),
-            json!({"name":"preview_fact_patch","description":"预览结构化事实的 create/update/merge/supersede/delete 操作，生成可审计且可撤销的草稿，不修改 Fact Ledger。","inputSchema":object_schema(vec![("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("target_fact_id",json!({"type":"string"})),("source_fact_ids",json!({"type":"array","items":{"type":"string"}})),("fact",json!({"type":"object","description":"create、update、supersede 的完整事实快照；merge 时可选，用于更新主事实。"}))])}),
-            json!({"name":"apply_fact_patch","description":"应用指定事实治理草稿，应用前校验事实预览指纹。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
-            json!({"name":"revert_fact_patch","description":"撤销指定已应用事实草稿；仅在应用后事实未变化时执行。","inputSchema":object_schema(vec![("patch_id",json!({"type":"string"}))])}),
-            json!({"name":"verify_fact_evidence","description":"验证结构化事实证据的路径、符号、行范围和内容哈希，不修改 Fact Ledger。","inputSchema":object_schema(vec![("fact_id",json!({"type":"string"}))])}),
+            json!({"name":"list_fact_patches","description":"分页列出结构化事实治理草稿，可按状态和操作过滤。","inputSchema":object_schema(vec![("status",json!({"type":"string","enum":["pending","applying","applied","reverting","reverted"]})),("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("offset",json!({"type":"integer","minimum":0})),("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
+            json!({"name":"preview_fact_patch","description":"预览结构化事实的 create/update/merge/supersede/delete 操作，生成可审计且可撤销的草稿，不修改 Fact Ledger。","inputSchema":object_schema_with_required(vec![("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("target_fact_id",json!({"type":"string"})),("source_fact_ids",json!({"type":"array","items":{"type":"string"}})),("fact",json!({"type":"object","description":"create、update、supersede 的完整事实快照；merge 时可选，用于更新主事实。"}))], &["operation"])}),
+            json!({"name":"apply_fact_patch","description":"应用指定事实治理草稿，应用前校验事实预览指纹。","inputSchema":object_schema_with_required(vec![("patch_id",json!({"type":"string"}))], &["patch_id"])}),
+            json!({"name":"revert_fact_patch","description":"撤销指定已应用事实草稿；仅在应用后事实未变化时执行。","inputSchema":object_schema_with_required(vec![("patch_id",json!({"type":"string"}))], &["patch_id"])}),
+            json!({"name":"verify_fact_evidence","description":"验证结构化事实证据并追加独立验证账本，不修改 Fact Ledger。","inputSchema":object_schema_with_required(vec![("fact_id",json!({"type":"string"}))], &["fact_id"])}),
+            json!({"name":"list_evidence_verifications","description":"分页读取独立事实证据验证记录。","inputSchema":object_schema(vec![("fact_id",json!({"type":"string"})),("offset",json!({"type":"integer","minimum":0})),("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
             fact_operation_tool("create_fact", "生成新增事实草稿", false, false),
             fact_operation_tool("update_fact", "生成更新事实草稿", true, false),
             fact_operation_tool("merge_facts", "生成合并事实草稿", true, true),
@@ -238,7 +243,8 @@ impl McpServer {
                     | "list_events"
                     | "list_agent_runs"
                     | "get_candidate_detail"
-                    | "verify_fact_evidence"
+                    | "list_fact_patches"
+                    | "list_evidence_verifications"
                     | "doctor"
             );
             if let Some(object) = tool.as_object_mut() {
@@ -279,11 +285,12 @@ impl McpServer {
             "review_candidate" => self.review_candidate(arguments)?,
             "apply_document_patch" => self.apply_document_patch(arguments)?,
             "revert_document_patch" => self.revert_document_patch(arguments)?,
-            "list_fact_patches" => self.list_fact_patches()?,
+            "list_fact_patches" => self.list_fact_patches(arguments)?,
             "preview_fact_patch" => self.preview_fact_patch(arguments)?,
             "apply_fact_patch" => self.apply_fact_patch(arguments)?,
             "revert_fact_patch" => self.revert_fact_patch(arguments)?,
             "verify_fact_evidence" => self.verify_fact_evidence(arguments)?,
+            "list_evidence_verifications" => self.list_evidence_verifications(arguments)?,
             "create_fact" => self.fact_operation(FactOperation::Create, arguments)?,
             "update_fact" => self.fact_operation(FactOperation::Update, arguments)?,
             "merge_facts" => self.fact_operation(FactOperation::Merge, arguments)?,
@@ -623,8 +630,25 @@ impl McpServer {
         }))
     }
 
-    fn list_fact_patches(&self) -> Result<Value> {
-        Ok(json!({"patches": core_list_fact_patches(&self.project_root)?}))
+    fn list_fact_patches(&self, arguments: Value) -> Result<Value> {
+        let page = core_query_fact_patches(
+            &self.project_root,
+            FactPatchQuery {
+                status: arguments
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::parse::<FactPatchStatus>)
+                    .transpose()?,
+                operation: arguments
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .map(str::parse::<FactOperation>)
+                    .transpose()?,
+                offset: optional_usize(&arguments, "offset", 0),
+                limit: optional_usize(&arguments, "limit", 50),
+            },
+        )?;
+        Ok(serde_json::to_value(page)?)
     }
 
     fn preview_fact_patch(&self, arguments: Value) -> Result<Value> {
@@ -666,6 +690,16 @@ impl McpServer {
             &self.project_root,
             required_string(&arguments, "fact_id")?,
         )?}))
+    }
+
+    fn list_evidence_verifications(&self, arguments: Value) -> Result<Value> {
+        let records = core_list_evidence_verifications(
+            &self.project_root,
+            arguments.get("fact_id").and_then(Value::as_str),
+            optional_usize(&arguments, "offset", 0),
+            optional_usize(&arguments, "limit", 50),
+        )?;
+        Ok(json!({"records":records}))
     }
 
     fn fact_operation(&self, operation: FactOperation, arguments: Value) -> Result<Value> {
@@ -1109,14 +1143,18 @@ fn text_result<T: Serialize>(payload: T) -> Result<Value> {
 }
 
 fn object_schema(properties: Vec<(&str, Value)>) -> Value {
+    let required = properties
+        .iter()
+        .filter_map(|(name, _)| (*name == "query").then_some(*name))
+        .collect::<Vec<_>>();
+    object_schema_with_required(properties, &required)
+}
+
+fn object_schema_with_required(properties: Vec<(&str, Value)>, required: &[&str]) -> Value {
     let mut property_map = serde_json::Map::new();
-    let mut required = Vec::new();
 
     for (name, schema) in properties {
         property_map.insert(name.to_string(), schema);
-        if name == "query" {
-            required.push(Value::String(name.to_string()));
-        }
     }
 
     json!({
@@ -1142,7 +1180,7 @@ fn fact_operation_tool(name: &str, description: &str, target: bool, sources: boo
             ),
             (
                 "evidence_details",
-                json!({"type":"array","items":{"type":"object"}}),
+                json!({"type":"array","items":fact_evidence_schema()}),
             ),
             (
                 "confidence",
@@ -1163,7 +1201,34 @@ fn fact_operation_tool(name: &str, description: &str, target: bool, sources: boo
             json!({"type":"array","items":{"type":"string"}}),
         ));
     }
-    json!({"name":name,"description":description,"inputSchema":object_schema(properties)})
+    let required = match name {
+        "create_fact" => vec!["statement"],
+        "update_fact" | "delete_fact" => vec!["target_fact_id"],
+        "merge_facts" => vec!["target_fact_id", "source_fact_ids"],
+        "supersede_fact" => vec!["target_fact_id", "statement"],
+        _ => Vec::new(),
+    };
+    json!({"name":name,"description":description,"inputSchema":object_schema_with_required(properties, &required)})
+}
+
+fn fact_evidence_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "path":{"type":"string"},
+            "symbol":{"type":"string"},
+            "line_start":{"type":"integer","minimum":1},
+            "line_end":{"type":"integer","minimum":1},
+            "content_hash":{"type":"string"},
+            "hash_scope":{"type":"string","enum":["file","line_range","symbol"]},
+            "git_head":{"type":"string"},
+            "captured_at":{"type":"string"},
+            "verified_at":{"type":"string"},
+            "evidence_type":{"type":"string"}
+        },
+        "required":["path"],
+        "additionalProperties":false
+    })
 }
 
 fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
@@ -1171,6 +1236,14 @@ fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
         .get(name)
         .and_then(Value::as_str)
         .with_context(|| format!("缺少字符串参数: {}", name))
+}
+
+fn optional_usize(arguments: &Value, name: &str, default: usize) -> usize {
+    arguments
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default)
 }
 
 fn optional_string_array(arguments: &Value, name: &str) -> Result<Vec<String>> {
@@ -1203,6 +1276,7 @@ fn is_write_tool(name: &str) -> bool {
             | "preview_fact_patch"
             | "apply_fact_patch"
             | "revert_fact_patch"
+            | "verify_fact_evidence"
             | "create_fact"
             | "update_fact"
             | "merge_facts"
@@ -1338,6 +1412,7 @@ mod tests {
         assert!(text.contains("begin_task"));
         assert!(text.contains("record_failed_approach"));
         assert!(text.contains("reconcile_project_knowledge"));
+        assert!(text.contains("list_evidence_verifications"));
         assert!(text.contains("doctor"));
     }
 
@@ -1450,6 +1525,37 @@ mod tests {
             .unwrap();
         assert_eq!(verification["report"]["issue_count"], 1);
         assert_eq!(verification["report"]["results"][0]["status"], "missing");
+        let history = server
+            .list_evidence_verifications(json!({"fact_id":fact_id,"limit":10}))
+            .unwrap();
+        assert_eq!(history["records"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fact_tool_schemas_declare_operation_specific_required_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(temp.path().to_path_buf());
+        let tools = server.tools();
+        let required = |name: &str| {
+            tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(required("create_fact"), vec!["statement"]);
+        assert_eq!(required("update_fact"), vec!["target_fact_id"]);
+        assert_eq!(
+            required("merge_facts"),
+            vec!["target_fact_id", "source_fact_ids"]
+        );
+        assert_eq!(
+            required("supersede_fact"),
+            vec!["target_fact_id", "statement"]
+        );
+        assert_eq!(required("delete_fact"), vec!["target_fact_id"]);
     }
 
     fn framed(value: Value) -> String {

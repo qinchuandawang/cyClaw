@@ -18,21 +18,25 @@ use cyclaw_knowledge::{
     KnowledgeCandidate, KnowledgeStatus, candidates_from_change_analysis, parse_jsonl, render_jsonl,
 };
 pub use cyclaw_memory::{
-    BeginTaskOptions, EvidenceVerificationStatus, FactContext, FactEvidence,
-    FactEvidenceVerification, FactInput, FactOperation, FactPatch, FactPatchRequest,
-    FactPatchStatus, FactType, FactVerificationReport, FailedApproach, ProjectFact,
-    ReconciliationReport, TaskCheckpoint, TaskDecision, TaskRecord,
+    BeginTaskOptions, EvidenceHashScope, EvidenceVerificationRecord, EvidenceVerificationStatus,
+    FactContext, FactEvidence, FactEvidenceVerification, FactInput, FactOperation, FactPatch,
+    FactPatchPage, FactPatchQuery, FactPatchRequest, FactPatchStatus, FactType,
+    FactVerificationReport, FailedApproach, ProjectFact, ReconciliationReport, TaskCheckpoint,
+    TaskDecision, TaskRecord,
 };
 use cyclaw_memory::{
     apply_fact_patch as memory_apply_fact_patch, begin_task as memory_begin_task,
     checkpoint_task as memory_checkpoint_task, close_task as memory_close_task,
     compile_fact_context, get_active_task as memory_active_task, get_task as memory_get_task,
     latest_reconciliation as memory_latest_reconciliation,
+    list_evidence_verifications as memory_list_evidence_verifications,
     list_fact_patches as memory_list_fact_patches, list_facts as memory_list_facts,
     list_tasks as memory_list_tasks, preview_fact_patch as memory_preview_fact_patch,
     project_fact_from_input as memory_project_fact_from_input,
+    query_fact_patches as memory_query_fact_patches,
     reconcile_knowledge as memory_reconcile_knowledge, record_decision as memory_record_decision,
     record_failed_approach as memory_record_failed_approach,
+    recover_fact_patch_transactions as memory_recover_fact_patch_transactions,
     revert_fact_patch as memory_revert_fact_patch,
     verify_fact_evidence as memory_verify_fact_evidence,
 };
@@ -818,7 +822,7 @@ pub fn project_status(project_root: PathBuf) -> Result<ProjectStatus> {
     let latest_run = latest_change_analysis_path(&project_root).ok();
     let inbox = read_inbox_candidates(&project_root).unwrap_or_default();
     let drafts = list_document_patches(project_root.clone()).unwrap_or_default();
-    let fact_patches = memory_list_fact_patches(&project_root).unwrap_or_default();
+    let fact_patches = memory_list_fact_patches(&project_root)?;
     let index = index_path(&project_root);
     let git_has_changes = current_change_fingerprint(&project_root)
         .map(|fingerprint| !fingerprint.trim().is_empty())
@@ -932,12 +936,29 @@ pub fn list_fact_patches(project_root: &Path) -> Result<Vec<FactPatch>> {
     memory_list_fact_patches(project_root)
 }
 
+pub fn recover_fact_patch_transactions(project_root: &Path) -> Result<Vec<String>> {
+    memory_recover_fact_patch_transactions(project_root)
+}
+
+pub fn query_fact_patches(project_root: &Path, query: FactPatchQuery) -> Result<FactPatchPage> {
+    memory_query_fact_patches(project_root, query)
+}
+
 pub fn project_fact_from_input(input: FactInput) -> ProjectFact {
     memory_project_fact_from_input(input)
 }
 
 pub fn verify_fact_evidence(project_root: &Path, fact_id: &str) -> Result<FactVerificationReport> {
     memory_verify_fact_evidence(project_root, fact_id)
+}
+
+pub fn list_evidence_verifications(
+    project_root: &Path,
+    fact_id: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<EvidenceVerificationRecord>> {
+    memory_list_evidence_verifications(project_root, fact_id, offset, limit)
 }
 
 pub fn get_latest_reconciliation(project_root: &Path) -> Result<Option<ReconciliationReport>> {
