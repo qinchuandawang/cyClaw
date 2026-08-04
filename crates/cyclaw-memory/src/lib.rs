@@ -1,11 +1,11 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Read, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -265,6 +265,48 @@ pub struct EvidenceVerificationPage {
     pub offset: usize,
     pub limit: usize,
     pub issues: Vec<EvidenceVerificationIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EvidenceVerificationArchiveIndex {
+    schema_version: u32,
+    source_file: String,
+    source_size: u64,
+    source_modified_ns: Option<u128>,
+    entries: Vec<EvidenceVerificationArchiveEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EvidenceVerificationArchiveEntry {
+    fact_id: String,
+    checked_at: String,
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, Clone)]
+enum EvidenceVerificationCandidate {
+    Loaded(EvidenceVerificationRecord),
+    Indexed {
+        archive_path: PathBuf,
+        entry: EvidenceVerificationArchiveEntry,
+    },
+}
+
+impl EvidenceVerificationCandidate {
+    fn fact_id(&self) -> &str {
+        match self {
+            Self::Loaded(record) => &record.fact_id,
+            Self::Indexed { entry, .. } => &entry.fact_id,
+        }
+    }
+
+    fn checked_at(&self) -> &str {
+        match self {
+            Self::Loaded(record) => &record.checked_at,
+            Self::Indexed { entry, .. } => &entry.checked_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -777,29 +819,66 @@ pub fn query_evidence_verifications(
     if let Some(fact_id) = fact_id {
         validate_fact_identifier(fact_id)?;
     }
-    let mut paths = evidence_verification_paths(project_root)?;
+    let paths = evidence_verification_paths(project_root)?;
     let active_path = evidence_verifications_path(project_root);
-    paths.push(active_path.clone());
-    let mut records = Vec::new();
+    let mut candidates = Vec::new();
     let mut issues = Vec::new();
-    for path in paths.into_iter().filter(|path| path.exists()) {
-        let tolerate_incomplete_tail = path == active_path;
-        let (path_records, path_issues) =
-            read_evidence_verification_file(&path, tolerate_incomplete_tail)?;
-        records.extend(path_records);
+    for path in paths {
+        if let Some(index) = read_evidence_verification_archive_index(&path)? {
+            candidates.extend(index.entries.into_iter().map(|entry| {
+                EvidenceVerificationCandidate::Indexed {
+                    archive_path: path.clone(),
+                    entry,
+                }
+            }));
+        } else {
+            let (records, path_issues) = read_evidence_verification_file(&path, false)?;
+            candidates.extend(
+                records
+                    .into_iter()
+                    .map(EvidenceVerificationCandidate::Loaded),
+            );
+            issues.extend(path_issues);
+        }
+    }
+    if active_path.exists() {
+        let (records, path_issues) = read_evidence_verification_file(&active_path, true)?;
+        candidates.extend(
+            records
+                .into_iter()
+                .map(EvidenceVerificationCandidate::Loaded),
+        );
         issues.extend(path_issues);
     }
-    records.retain(|record| fact_id.is_none_or(|fact_id| record.fact_id == fact_id));
-    records.sort_by(|left, right| right.checked_at.cmp(&left.checked_at));
-    let total = records.len();
+    candidates.retain(|candidate| fact_id.is_none_or(|fact_id| candidate.fact_id() == fact_id));
+    candidates.sort_by(|left, right| right.checked_at().cmp(left.checked_at()));
+    let total = candidates.len();
     let limit = limit.clamp(1, 200);
+    let records = candidates
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(materialize_evidence_verification_candidate)
+        .collect::<Result<Vec<_>>>()?;
     Ok(EvidenceVerificationPage {
-        records: records.into_iter().skip(offset).take(limit).collect(),
+        records,
         total,
         offset,
         limit,
         issues,
     })
+}
+
+fn materialize_evidence_verification_candidate(
+    candidate: EvidenceVerificationCandidate,
+) -> Result<EvidenceVerificationRecord> {
+    match candidate {
+        EvidenceVerificationCandidate::Loaded(record) => Ok(record),
+        EvidenceVerificationCandidate::Indexed {
+            archive_path,
+            entry,
+        } => read_indexed_evidence_verification(&archive_path, &entry),
+    }
 }
 
 fn read_evidence_verification_file(
@@ -2475,6 +2554,10 @@ fn evidence_verifications_archive_dir(project_root: &Path) -> PathBuf {
     memory_dir(project_root).join("evidence-verifications")
 }
 
+fn evidence_verification_archive_index_path(archive_path: &Path) -> PathBuf {
+    archive_path.with_extension("index.json")
+}
+
 fn evidence_verification_paths(project_root: &Path) -> Result<Vec<PathBuf>> {
     let dir = evidence_verifications_archive_dir(project_root);
     if !dir.exists() {
@@ -2486,6 +2569,137 @@ fn evidence_verification_paths(project_root: &Path) -> Result<Vec<PathBuf>> {
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
+}
+
+fn write_evidence_verification_archive_index(
+    source_path: &Path,
+    archive_path: &Path,
+) -> Result<PathBuf> {
+    let index_path = evidence_verification_archive_index_path(archive_path);
+    if archive_path.exists() || index_path.exists() {
+        anyhow::bail!("证据验证归档名称冲突: {}", archive_path.display());
+    }
+    let source_metadata = fs::metadata(source_path)?;
+    let source_file = archive_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("证据验证归档缺少合法文件名")?
+        .to_string();
+    let mut reader = BufReader::new(File::open(source_path)?);
+    let mut entries = Vec::new();
+    let mut offset = 0_u64;
+    let mut line_number = 0_usize;
+    loop {
+        let mut line = Vec::new();
+        let length = reader.read_until(b'\n', &mut line)?;
+        if length == 0 {
+            break;
+        }
+        line_number += 1;
+        let record_bytes = line.strip_suffix(b"\n").unwrap_or(&line);
+        let record_bytes = record_bytes.strip_suffix(b"\r").unwrap_or(record_bytes);
+        if !record_bytes.iter().all(u8::is_ascii_whitespace) {
+            let record = serde_json::from_slice::<EvidenceVerificationRecord>(record_bytes)
+                .with_context(|| {
+                    format!(
+                        "证据验证账本损坏: {}:{}",
+                        source_path.display(),
+                        line_number
+                    )
+                })?;
+            entries.push(EvidenceVerificationArchiveEntry {
+                fact_id: record.fact_id,
+                checked_at: record.checked_at,
+                offset,
+                length: length as u64,
+            });
+        }
+        offset = offset.saturating_add(length as u64);
+    }
+    let index = EvidenceVerificationArchiveIndex {
+        schema_version: 1,
+        source_file,
+        source_size: source_metadata.len(),
+        source_modified_ns: metadata_modified_ns(&source_metadata),
+        entries,
+    };
+    atomic_write(
+        &index_path,
+        serde_json::to_string_pretty(&index)?.as_bytes(),
+    )?;
+    Ok(index_path)
+}
+
+fn read_evidence_verification_archive_index(
+    archive_path: &Path,
+) -> Result<Option<EvidenceVerificationArchiveIndex>> {
+    let index_path = evidence_verification_archive_index_path(archive_path);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let Ok(content) = fs::read_to_string(&index_path) else {
+        return Ok(None);
+    };
+    let Ok(index) = serde_json::from_str::<EvidenceVerificationArchiveIndex>(&content) else {
+        return Ok(None);
+    };
+    let metadata = fs::metadata(archive_path)?;
+    let expected_file = archive_path.file_name().and_then(|value| value.to_str());
+    let entries_valid = index.entries.iter().all(|entry| {
+        entry.length > 0
+            && entry
+                .offset
+                .checked_add(entry.length)
+                .is_some_and(|end| end <= metadata.len())
+    });
+    if index.schema_version != 1
+        || expected_file != Some(index.source_file.as_str())
+        || index.source_size != metadata.len()
+        || index.source_modified_ns != metadata_modified_ns(&metadata)
+        || !entries_valid
+    {
+        return Ok(None);
+    }
+    Ok(Some(index))
+}
+
+fn read_indexed_evidence_verification(
+    archive_path: &Path,
+    entry: &EvidenceVerificationArchiveEntry,
+) -> Result<EvidenceVerificationRecord> {
+    let mut file = File::open(archive_path)?;
+    file.seek(std::io::SeekFrom::Start(entry.offset))?;
+    let length = usize::try_from(entry.length).context("证据验证归档索引长度超出平台限制")?;
+    let mut line = vec![0_u8; length];
+    file.read_exact(&mut line)?;
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    let record =
+        serde_json::from_slice::<EvidenceVerificationRecord>(&line).with_context(|| {
+            format!(
+                "证据验证归档索引指向无效记录: {}:{}",
+                archive_path.display(),
+                entry.offset
+            )
+        })?;
+    if record.fact_id != entry.fact_id || record.checked_at != entry.checked_at {
+        anyhow::bail!(
+            "证据验证归档索引与账本不一致: {}:{}",
+            archive_path.display(),
+            entry.offset
+        );
+    }
+    Ok(record)
+}
+
+fn metadata_modified_ns(metadata: &fs::Metadata) -> Option<u128> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
 }
 
 fn append_evidence_verification(
@@ -2527,7 +2741,18 @@ fn append_evidence_verification_with_limit(
             "evidence-verifications-{}.jsonl",
             Utc::now().format("%Y%m%dT%H%M%S%fZ")
         );
-        fs::rename(&path, archive_dir.join(archive_name))?;
+        let archive_path = archive_dir.join(archive_name);
+        let index_path = write_evidence_verification_archive_index(&path, &archive_path)?;
+        if let Err(error) = fs::rename(&path, &archive_path) {
+            let _ = fs::remove_file(index_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "无法滚动证据验证账本: {} -> {}",
+                    path.display(),
+                    archive_path.display()
+                )
+            });
+        }
         prune_evidence_verification_archives(project_root, archive_limit)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -2565,7 +2790,11 @@ fn prune_evidence_verification_archives(project_root: &Path, limit: usize) -> Re
     let paths = evidence_verification_paths(project_root)?;
     let remove_count = paths.len().saturating_sub(limit);
     for path in paths.into_iter().take(remove_count) {
-        fs::remove_file(path)?;
+        fs::remove_file(&path)?;
+        let index_path = evidence_verification_archive_index_path(&path);
+        if index_path.exists() {
+            fs::remove_file(index_path)?;
+        }
     }
     Ok(())
 }
@@ -3281,10 +3510,63 @@ mod tests {
             append_evidence_verification_with_limit(temp.path(), &report, 1, 2).unwrap();
         }
 
-        assert_eq!(evidence_verification_paths(temp.path()).unwrap().len(), 2);
+        let archives = evidence_verification_paths(temp.path()).unwrap();
+        assert_eq!(archives.len(), 2);
+        for archive in &archives {
+            let index_path = evidence_verification_archive_index_path(archive);
+            assert!(index_path.exists());
+            let index = read_evidence_verification_archive_index(archive)
+                .unwrap()
+                .unwrap();
+            assert_eq!(index.schema_version, 1);
+            assert_eq!(index.entries.len(), 1);
+        }
+        let index_count = fs::read_dir(evidence_verifications_archive_dir(temp.path()))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".index.json"))
+            .count();
+        assert_eq!(index_count, 2);
         let records = list_evidence_verifications(temp.path(), Some("one"), 0, 20).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].checked_at, "2026-08-04T12:00:04Z");
+        let page = query_evidence_verifications(temp.path(), Some("one"), 1, 1).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.records[0].checked_at, "2026-08-04T12:00:03Z");
+
+        fs::write(
+            evidence_verification_archive_index_path(&archives[0]),
+            [0xff, 0xfe],
+        )
+        .unwrap();
+        let fallback = query_evidence_verifications(temp.path(), Some("one"), 0, 20).unwrap();
+        assert_eq!(fallback.records.len(), 3);
+    }
+
+    #[test]
+    fn stale_evidence_verification_archive_index_falls_back_to_strict_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        seed(&temp, &[fact("one", "需要验证")]);
+        for index in 0..2 {
+            let report = FactVerificationReport {
+                fact_id: "one".to_string(),
+                results: Vec::new(),
+                verified_count: 0,
+                issue_count: 0,
+                checked_at: format!("2026-08-04T12:00:0{index}Z"),
+            };
+            append_evidence_verification_with_limit(temp.path(), &report, 1, 2).unwrap();
+        }
+        let archive = evidence_verification_paths(temp.path()).unwrap().remove(0);
+        OpenOptions::new()
+            .append(true)
+            .open(&archive)
+            .unwrap()
+            .write_all(b"{broken}\n")
+            .unwrap();
+
+        let error = query_evidence_verifications(temp.path(), None, 0, 20).unwrap_err();
+        assert!(error.to_string().contains("账本损坏"));
     }
 
     #[test]
