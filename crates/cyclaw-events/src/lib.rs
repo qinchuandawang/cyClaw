@@ -42,6 +42,8 @@ pub enum AgentEventType {
     FactPatchCreated,
     FactPatchApplied,
     FactPatchReverted,
+    FactPatchRecoveryCompleted,
+    FactPatchRecoveryBlocked,
     KnowledgeReconciled,
 }
 

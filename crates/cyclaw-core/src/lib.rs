@@ -18,12 +18,13 @@ use cyclaw_knowledge::{
     KnowledgeCandidate, KnowledgeStatus, candidates_from_change_analysis, parse_jsonl, render_jsonl,
 };
 pub use cyclaw_memory::{
-    BeginTaskOptions, EvidenceHashScope, EvidenceVerificationRecord, EvidenceVerificationStatus,
-    FactContext, FactEvidence, FactEvidenceVerification, FactInput, FactOperation, FactPatch,
-    FactPatchPage, FactPatchQuery, FactPatchRequest, FactPatchStatus, FactRecoveryFailure,
-    FactRecoveryReport, FactTransactionDiagnostic, FactTransactionDiagnosticStatus,
-    FactTransactionDiagnostics, FactType, FactVerificationReport, FailedApproach, ProjectFact,
-    ReconciliationReport, TaskCheckpoint, TaskDecision, TaskRecord,
+    BeginTaskOptions, EvidenceHashScope, EvidenceVerificationIssue, EvidenceVerificationPage,
+    EvidenceVerificationRecord, EvidenceVerificationStatus, FactContext, FactEvidence,
+    FactEvidenceVerification, FactInput, FactOperation, FactPatch, FactPatchPage, FactPatchQuery,
+    FactPatchRequest, FactPatchStatus, FactRecoveryFailure, FactRecoveryReport,
+    FactTransactionDiagnostic, FactTransactionDiagnosticStatus, FactTransactionDiagnostics,
+    FactType, FactVerificationReport, FailedApproach, ProjectFact, ReconciliationReport,
+    TaskCheckpoint, TaskDecision, TaskRecord,
 };
 use cyclaw_memory::{
     apply_fact_patch as memory_apply_fact_patch, begin_task as memory_begin_task,
@@ -31,11 +32,13 @@ use cyclaw_memory::{
     compile_fact_context,
     diagnose_fact_patch_transactions as memory_diagnose_fact_patch_transactions,
     get_active_task as memory_active_task, get_task as memory_get_task,
+    latest_fact_recovery_report as memory_latest_fact_recovery_report,
     latest_reconciliation as memory_latest_reconciliation,
     list_evidence_verifications as memory_list_evidence_verifications,
     list_fact_patches as memory_list_fact_patches, list_facts as memory_list_facts,
     list_tasks as memory_list_tasks, preview_fact_patch as memory_preview_fact_patch,
     project_fact_from_input as memory_project_fact_from_input,
+    query_evidence_verifications as memory_query_evidence_verifications,
     query_fact_patches as memory_query_fact_patches,
     reconcile_knowledge as memory_reconcile_knowledge, record_decision as memory_record_decision,
     record_failed_approach as memory_record_failed_approach,
@@ -947,6 +950,10 @@ pub fn diagnose_fact_patch_transactions(project_root: &Path) -> Result<FactTrans
     memory_diagnose_fact_patch_transactions(project_root)
 }
 
+pub fn get_latest_fact_recovery_report(project_root: &Path) -> Result<Option<FactRecoveryReport>> {
+    memory_latest_fact_recovery_report(project_root)
+}
+
 pub fn query_fact_patches(project_root: &Path, query: FactPatchQuery) -> Result<FactPatchPage> {
     memory_query_fact_patches(project_root, query)
 }
@@ -966,6 +973,15 @@ pub fn list_evidence_verifications(
     limit: usize,
 ) -> Result<Vec<EvidenceVerificationRecord>> {
     memory_list_evidence_verifications(project_root, fact_id, offset, limit)
+}
+
+pub fn query_evidence_verifications(
+    project_root: &Path,
+    fact_id: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<EvidenceVerificationPage> {
+    memory_query_evidence_verifications(project_root, fact_id, offset, limit)
 }
 
 pub fn get_latest_reconciliation(project_root: &Path) -> Result<Option<ReconciliationReport>> {

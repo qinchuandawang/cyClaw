@@ -33,7 +33,11 @@ pub fn acquire_lock(project_root: &Path, name: &str, timeout: Duration) -> Resul
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(_) => return Ok(ProjectLock { path }),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            Err(error)
+                if error.kind() == ErrorKind::AlreadyExists
+                    || (error.kind() == ErrorKind::PermissionDenied && path.exists()) =>
+            {
+                // Windows 可能将已存在锁文件的 create_new 竞争报告为 PermissionDenied。
                 if Instant::now() >= deadline {
                     anyhow::bail!("获取项目锁超时: {}", path.display());
                 }

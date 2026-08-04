@@ -6,20 +6,20 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use cyclaw_agent::{AgentRunOptions, cleanup_agent_runs, list_agent_runs, run_agent_once};
 use cyclaw_core::{
-    BeginTaskOptions, DiffOptions, DraftOptions, FactInput, FactOperation, FactPatch,
-    FactPatchQuery, FactPatchRequest, FactPatchStatus, FactType, InboxGenerateOptions, InitOptions,
-    ProjectFact, ScanOptions, SearchOptions, analyze_project_diff, apply_document_patch,
-    apply_fact_patch, begin_task, checkpoint_task, close_task, current_change_snapshot,
-    diagnose_fact_patch_transactions, generate_document_drafts, generate_inbox, get_active_task,
-    get_latest_reconciliation, get_task_context, index_project, init_project,
-    list_document_patches, list_evidence_verifications, list_inbox, list_project_facts, list_tasks,
-    preview_fact_patch, project_fact_from_input, project_status, query_fact_patches,
-    reconcile_project_knowledge, record_task_decision, record_task_failed_approach,
-    revert_document_patch, revert_fact_patch, scan_project, search_project, update_inbox_status,
-    verify_fact_evidence, watch_project_once,
+    BeginTaskOptions, DiffOptions, DraftOptions, EvidenceHashScope, FactEvidence, FactInput,
+    FactOperation, FactPatch, FactPatchQuery, FactPatchRequest, FactPatchStatus, FactType,
+    InboxGenerateOptions, InitOptions, ProjectFact, ScanOptions, SearchOptions,
+    analyze_project_diff, apply_document_patch, apply_fact_patch, begin_task, checkpoint_task,
+    close_task, current_change_snapshot, diagnose_fact_patch_transactions,
+    generate_document_drafts, generate_inbox, get_active_task, get_latest_reconciliation,
+    get_task_context, index_project, init_project, list_document_patches, list_inbox,
+    list_project_facts, list_tasks, preview_fact_patch, project_fact_from_input, project_status,
+    query_evidence_verifications, query_fact_patches, reconcile_project_knowledge,
+    record_task_decision, record_task_failed_approach, revert_document_patch, revert_fact_patch,
+    scan_project, search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
 };
 use cyclaw_docs::KnowledgeOperation;
 use cyclaw_knowledge::{KnowledgeImportance, KnowledgeStatus};
@@ -244,6 +244,86 @@ enum DraftCommand {
     },
 }
 
+#[derive(Args)]
+struct EvidenceOptions {
+    /// 证据路径；结构化定位参数存在时只允许一个路径
+    #[arg(long = "evidence")]
+    paths: Vec<String>,
+    /// 证据对应的符号名称
+    #[arg(long = "evidence-symbol")]
+    symbol: Option<String>,
+    /// 证据起始行，从 1 开始
+    #[arg(long = "evidence-line-start")]
+    line_start: Option<u32>,
+    /// 证据结束行，默认等于起始行
+    #[arg(long = "evidence-line-end")]
+    line_end: Option<u32>,
+    /// 哈希范围：file、line_range、symbol
+    #[arg(long = "evidence-hash-scope")]
+    hash_scope: Option<EvidenceHashScope>,
+    /// 证据类型，例如 file、source、config
+    #[arg(long = "evidence-type", default_value = "file")]
+    evidence_type: String,
+}
+
+impl EvidenceOptions {
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+            && self.symbol.is_none()
+            && self.line_start.is_none()
+            && self.line_end.is_none()
+            && self.hash_scope.is_none()
+    }
+
+    fn into_parts(self) -> Result<(Vec<String>, Vec<FactEvidence>)> {
+        let structured = self.symbol.is_some()
+            || self.line_start.is_some()
+            || self.line_end.is_some()
+            || self.hash_scope.is_some()
+            || self.evidence_type != "file";
+        if !structured {
+            return Ok((self.paths, Vec::new()));
+        }
+        if self.paths.len() != 1 {
+            anyhow::bail!("结构化证据定位参数要求且只允许一个 --evidence 路径");
+        }
+        if self.line_end.is_some() && self.line_start.is_none() {
+            anyhow::bail!("--evidence-line-end 必须与 --evidence-line-start 一起使用");
+        }
+        let hash_scope = self.hash_scope.or_else(|| {
+            if self.symbol.is_some() {
+                Some(EvidenceHashScope::Symbol)
+            } else if self.line_start.is_some() {
+                Some(EvidenceHashScope::LineRange)
+            } else {
+                Some(EvidenceHashScope::File)
+            }
+        });
+        if hash_scope == Some(EvidenceHashScope::Symbol) && self.symbol.is_none() {
+            anyhow::bail!("symbol 哈希范围必须提供 --evidence-symbol");
+        }
+        if hash_scope == Some(EvidenceHashScope::LineRange) && self.line_start.is_none() {
+            anyhow::bail!("line_range 哈希范围必须提供 --evidence-line-start");
+        }
+        let path = self.paths[0].clone();
+        Ok((
+            vec![path.clone()],
+            vec![FactEvidence {
+                path,
+                symbol: self.symbol,
+                line_start: self.line_start,
+                line_end: self.line_end,
+                content_hash: None,
+                hash_scope,
+                git_head: None,
+                captured_at: String::new(),
+                verified_at: String::new(),
+                evidence_type: self.evidence_type,
+            }],
+        ))
+    }
+}
+
 #[derive(Subcommand)]
 enum FactCommand {
     /// 新增事实；默认只生成草稿
@@ -251,8 +331,8 @@ enum FactCommand {
         statement: String,
         #[arg(long, default_value = "unknown")]
         fact_type: String,
-        #[arg(long = "evidence")]
-        evidence: Vec<String>,
+        #[command(flatten)]
+        evidence: EvidenceOptions,
         #[arg(long, default_value_t = 90)]
         confidence: u8,
         #[arg(long, default_value_t = false)]
@@ -267,8 +347,8 @@ enum FactCommand {
         statement: Option<String>,
         #[arg(long)]
         fact_type: Option<String>,
-        #[arg(long = "evidence")]
-        evidence: Vec<String>,
+        #[command(flatten)]
+        evidence: EvidenceOptions,
         #[arg(long)]
         confidence: Option<u8>,
         #[arg(long, default_value_t = false)]
@@ -294,8 +374,8 @@ enum FactCommand {
         statement: String,
         #[arg(long, default_value = "unknown")]
         fact_type: String,
-        #[arg(long = "evidence")]
-        evidence: Vec<String>,
+        #[command(flatten)]
+        evidence: EvidenceOptions,
         #[arg(long, default_value_t = 90)]
         confidence: u8,
         #[arg(long, default_value_t = false)]
@@ -860,7 +940,7 @@ fn main() -> Result<()> {
                 path,
             } => {
                 let root = resolve_path(path)?;
-                let fact = new_fact(statement, fact_type.parse()?, evidence, confidence);
+                let fact = new_fact(statement, fact_type.parse()?, evidence, confidence)?;
                 let patch = preview_fact_patch(
                     &root,
                     FactPatchRequest {
@@ -897,8 +977,9 @@ fn main() -> Result<()> {
                     fact.fact_type = fact_type.parse()?;
                 }
                 if !evidence.is_empty() {
-                    fact.evidence = evidence;
-                    fact.evidence_details.clear();
+                    let (paths, details) = evidence.into_parts()?;
+                    fact.evidence = paths;
+                    fact.evidence_details = details;
                 }
                 if let Some(confidence) = confidence {
                     fact.confidence = confidence.min(100);
@@ -950,7 +1031,7 @@ fn main() -> Result<()> {
                 path,
             } => {
                 let root = resolve_path(path)?;
-                let fact = new_fact(statement, fact_type.parse()?, evidence, confidence);
+                let fact = new_fact(statement, fact_type.parse()?, evidence, confidence)?;
                 let patch = preview_fact_patch(
                     &root,
                     FactPatchRequest {
@@ -1041,12 +1122,22 @@ fn main() -> Result<()> {
                 limit,
                 path,
             } => {
-                for record in list_evidence_verifications(
+                let page = query_evidence_verifications(
                     &resolve_path(path)?,
                     fact_id.as_deref(),
                     offset,
                     limit,
-                )? {
+                )?;
+                println!(
+                    "验证记录总数: {}，当前偏移: {}，返回: {}",
+                    page.total,
+                    page.offset,
+                    page.records.len()
+                );
+                for issue in page.issues {
+                    eprintln!("账本诊断: {}:{} {}", issue.path, issue.line, issue.reason);
+                }
+                for record in page.records {
                     println!(
                         "{} {} 已验证={} 问题={}",
                         record.checked_at,
@@ -1634,19 +1725,20 @@ fn resolve_path(path: Option<PathBuf>) -> Result<PathBuf> {
 fn new_fact(
     statement: String,
     fact_type: FactType,
-    evidence: Vec<String>,
+    evidence: EvidenceOptions,
     confidence: u8,
-) -> ProjectFact {
-    project_fact_from_input(FactInput {
+) -> Result<ProjectFact> {
+    let (paths, details) = evidence.into_parts()?;
+    Ok(project_fact_from_input(FactInput {
         statement,
         fact_type,
-        evidence,
-        evidence_details: Vec::new(),
+        evidence: paths,
+        evidence_details: details,
         source_task_id: None,
         confidence,
         valid_from: None,
         valid_until: None,
-    })
+    }))
 }
 
 fn find_project_fact(project_root: &Path, fact_id: &str) -> Result<ProjectFact> {

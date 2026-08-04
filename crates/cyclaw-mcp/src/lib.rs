@@ -12,11 +12,12 @@ use cyclaw_core::{
     close_task as close_project_task,
     diagnose_fact_patch_transactions as core_diagnose_fact_transactions, generate_document_drafts,
     get_active_task as core_get_active_task,
+    get_latest_fact_recovery_report as core_get_latest_fact_recovery,
     get_latest_reconciliation as core_get_latest_reconciliation,
-    get_task_context as core_get_task_context, list_document_patches,
-    list_evidence_verifications as core_list_evidence_verifications, list_inbox,
+    get_task_context as core_get_task_context, list_document_patches, list_inbox,
     list_project_facts as core_list_project_facts, list_tasks as core_list_tasks,
     preview_fact_patch as preview_fact_patch_core, project_fact_from_input, project_status,
+    query_evidence_verifications as core_query_evidence_verifications,
     query_fact_patches as core_query_fact_patches,
     reconcile_project_knowledge as core_reconcile_project_knowledge, record_task_decision,
     record_task_failed_approach, recover_fact_patch_transactions as recover_fact_transactions,
@@ -194,7 +195,7 @@ impl McpServer {
             json!({"name":"apply_fact_patch","description":"应用指定事实治理草稿，应用前校验事实预览指纹。","inputSchema":object_schema_with_required(vec![("patch_id",json!({"type":"string"}))], &["patch_id"])}),
             json!({"name":"revert_fact_patch","description":"撤销指定已应用事实草稿；仅在应用后事实未变化时执行。","inputSchema":object_schema_with_required(vec![("patch_id",json!({"type":"string"}))], &["patch_id"])}),
             json!({"name":"verify_fact_evidence","description":"验证结构化事实证据并追加独立验证账本，不修改 Fact Ledger。","inputSchema":object_schema_with_required(vec![("fact_id",json!({"type":"string"}))], &["fact_id"])}),
-            json!({"name":"list_evidence_verifications","description":"分页读取独立事实证据验证记录。","inputSchema":object_schema(vec![("fact_id",json!({"type":"string"})),("offset",json!({"type":"integer","minimum":0})),("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
+            json!({"name":"list_evidence_verifications","description":"分页读取独立事实证据验证记录，并返回总数和账本损坏诊断。","inputSchema":object_schema(vec![("fact_id",json!({"type":"string"})),("offset",json!({"type":"integer","minimum":0})),("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
             json!({"name":"list_fact_transactions","description":"只读诊断待恢复的 Fact Patch 事务，不修改账本。","inputSchema":object_schema(vec![])}),
             fact_operation_tool("create_fact", "生成新增事实草稿", false, false),
             fact_operation_tool("update_fact", "生成更新事实草稿", true, false),
@@ -698,13 +699,13 @@ impl McpServer {
     }
 
     fn list_evidence_verifications(&self, arguments: Value) -> Result<Value> {
-        let records = core_list_evidence_verifications(
+        let page = core_query_evidence_verifications(
             &self.project_root,
             arguments.get("fact_id").and_then(Value::as_str),
             optional_usize(&arguments, "offset", 0),
             optional_usize(&arguments, "limit", 50),
         )?;
-        Ok(json!({"records":records}))
+        Ok(serde_json::to_value(page)?)
     }
 
     fn list_fact_transactions(&self) -> Result<Value> {
@@ -855,28 +856,45 @@ impl McpServer {
         let policy = load_or_default(&self.project_root)?;
         let providers = list_providers(self.project_root.clone())?;
         let transactions = core_diagnose_fact_transactions(&self.project_root)?;
-        let checks = vec![
-            json!({"name":"git_repository","ok":self.project_root.join(".git").exists()}),
-            json!({"name":"cyclaw_initialized","ok":status.initialized}),
-            json!({"name":"policy_loaded","ok":status.config_exists}),
-            json!({"name":"knowledge_inbox","ok":status.inbox_exists}),
-            json!({"name":"active_model","ok":providers.active_provider.is_some()}),
-            json!({"name":"docs_write_permission","ok":policy.permissions.allow_docs_apply}),
+        let recovery = core_get_latest_fact_recovery(&self.project_root)?;
+        let required_checks = vec![
+            json!({"name":"git_repository","ok":self.project_root.join(".git").exists(),"severity":"required"}),
+            json!({"name":"cyclaw_initialized","ok":status.initialized,"severity":"required"}),
+            json!({"name":"policy_loaded","ok":status.config_exists,"severity":"required"}),
+            json!({"name":"knowledge_inbox","ok":status.inbox_exists,"severity":"required"}),
             json!({
                 "name":"fact_transactions",
                 "ok":transactions.blocked_count == 0,
+                "severity":"required",
                 "pending":transactions.pending_count,
                 "recoverable":transactions.recoverable_count,
                 "blocked":transactions.blocked_count,
                 "details":transactions.transactions
             }),
         ];
-        let healthy = checks
+        let optional_checks = vec![
+            json!({"name":"active_model","ok":providers.active_provider.is_some(),"severity":"optional"}),
+            json!({"name":"docs_write_permission","ok":policy.permissions.allow_docs_apply,"severity":"optional"}),
+        ];
+        let healthy = required_checks
             .iter()
             .all(|check| check["ok"].as_bool().unwrap_or(false));
-        Ok(
-            json!({ "healthy": healthy, "checks": checks, "suggested_next_steps": status.suggested_next_steps }),
-        )
+        let degraded_capabilities = optional_checks
+            .iter()
+            .filter(|check| !check["ok"].as_bool().unwrap_or(false))
+            .filter_map(|check| check["name"].as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        let checks = required_checks
+            .into_iter()
+            .chain(optional_checks)
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "healthy": healthy,
+            "checks": checks,
+            "degraded_capabilities": degraded_capabilities,
+            "latest_fact_recovery": recovery,
+            "suggested_next_steps": status.suggested_next_steps
+        }))
     }
 
     fn begin_task(&self, arguments: Value) -> Result<Value> {
@@ -1478,6 +1496,38 @@ mod tests {
 
         assert_eq!(result["healthy"], false);
         assert!(result["checks"].is_array());
+        assert!(result["latest_fact_recovery"].is_null());
+        assert!(
+            result["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["severity"] == "required")
+        );
+    }
+
+    #[test]
+    fn doctor_keeps_required_health_when_optional_capabilities_are_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(".git")).unwrap();
+        cyclaw_core::init_project(cyclaw_core::InitOptions::new(temp.path().to_path_buf()))
+            .unwrap();
+        fs::write(temp.path().join(".cyclaw/knowledge-inbox.jsonl"), "").unwrap();
+        let server = McpServer::new(temp.path().to_path_buf());
+
+        let result = server.doctor().unwrap();
+
+        assert_eq!(result["healthy"], true);
+        let degraded = result["degraded_capabilities"].as_array().unwrap();
+        assert!(degraded.iter().any(|item| item == "active_model"));
+        assert!(degraded.iter().any(|item| item == "docs_write_permission"));
+        let optional_checks = result["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|check| check["severity"] == "optional")
+            .count();
+        assert_eq!(optional_checks, 2);
     }
 
     #[test]
@@ -1501,6 +1551,7 @@ mod tests {
             .unwrap();
         assert_eq!(transaction_check["ok"], false);
         assert_eq!(transaction_check["blocked"], 1);
+        assert_eq!(transaction_check["severity"], "required");
 
         let input = framed(json!({
             "jsonrpc":"2.0","id":1,"method":"initialize","params":{}

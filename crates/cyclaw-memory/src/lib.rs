@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -195,6 +195,19 @@ pub enum EvidenceHashScope {
     Symbol,
 }
 
+impl std::str::FromStr for EvidenceHashScope {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "file" => Ok(Self::File),
+            "line_range" => Ok(Self::LineRange),
+            "symbol" => Ok(Self::Symbol),
+            _ => anyhow::bail!("未知证据哈希范围: {}", value),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceVerificationStatus {
@@ -236,6 +249,22 @@ pub struct EvidenceVerificationRecord {
     pub verified_count: usize,
     pub issue_count: usize,
     pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceVerificationIssue {
+    pub path: String,
+    pub line: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceVerificationPage {
+    pub records: Vec<EvidenceVerificationRecord>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub issues: Vec<EvidenceVerificationIssue>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +380,8 @@ pub struct FactRecoveryFailure {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct FactRecoveryReport {
+    #[serde(default)]
+    pub checked_at: String,
     pub recovered: Vec<String>,
     pub failures: Vec<FactRecoveryFailure>,
 }
@@ -734,28 +765,81 @@ pub fn list_evidence_verifications(
     offset: usize,
     limit: usize,
 ) -> Result<Vec<EvidenceVerificationRecord>> {
+    Ok(query_evidence_verifications(project_root, fact_id, offset, limit)?.records)
+}
+
+pub fn query_evidence_verifications(
+    project_root: &Path,
+    fact_id: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<EvidenceVerificationPage> {
     if let Some(fact_id) = fact_id {
         validate_fact_identifier(fact_id)?;
     }
     let mut paths = evidence_verification_paths(project_root)?;
-    paths.push(evidence_verifications_path(project_root));
+    let active_path = evidence_verifications_path(project_root);
+    paths.push(active_path.clone());
     let mut records = Vec::new();
+    let mut issues = Vec::new();
     for path in paths.into_iter().filter(|path| path.exists()) {
-        records.extend(
-            fs::read_to_string(path)?
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| Ok(serde_json::from_str::<EvidenceVerificationRecord>(line)?))
-                .collect::<Result<Vec<_>>>()?,
-        );
+        let tolerate_incomplete_tail = path == active_path;
+        let (path_records, path_issues) =
+            read_evidence_verification_file(&path, tolerate_incomplete_tail)?;
+        records.extend(path_records);
+        issues.extend(path_issues);
     }
     records.retain(|record| fact_id.is_none_or(|fact_id| record.fact_id == fact_id));
     records.sort_by(|left, right| right.checked_at.cmp(&left.checked_at));
-    Ok(records
-        .into_iter()
-        .skip(offset)
-        .take(limit.clamp(1, 200))
-        .collect())
+    let total = records.len();
+    let limit = limit.clamp(1, 200);
+    Ok(EvidenceVerificationPage {
+        records: records.into_iter().skip(offset).take(limit).collect(),
+        total,
+        offset,
+        limit,
+        issues,
+    })
+}
+
+fn read_evidence_verification_file(
+    path: &Path,
+    tolerate_incomplete_tail: bool,
+) -> Result<(
+    Vec<EvidenceVerificationRecord>,
+    Vec<EvidenceVerificationIssue>,
+)> {
+    let content = fs::read_to_string(path)?;
+    let ends_with_newline = content.ends_with('\n');
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut records = Vec::new();
+    let mut issues = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<EvidenceVerificationRecord>(line) {
+            Ok(record) => records.push(record),
+            Err(error)
+                if tolerate_incomplete_tail && index + 1 == lines.len() && !ends_with_newline =>
+            {
+                issues.push(EvidenceVerificationIssue {
+                    path: path.display().to_string(),
+                    line: index + 1,
+                    reason: format!("忽略进程中断留下的不完整末行: {}", error),
+                });
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "证据验证账本损坏: {}:{}: {}",
+                    path.display(),
+                    index + 1,
+                    error
+                );
+            }
+        }
+    }
+    Ok((records, issues))
 }
 
 fn verify_fact(project_root: &Path, fact: &ProjectFact) -> FactVerificationReport {
@@ -1258,7 +1342,10 @@ fn recover_fact_patch_transactions_locked(project_root: &Path) -> Result<FactRec
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         .collect::<Vec<_>>();
     paths.sort();
-    let mut report = FactRecoveryReport::default();
+    let mut report = FactRecoveryReport {
+        checked_at: Utc::now().to_rfc3339(),
+        ..FactRecoveryReport::default()
+    };
     for path in paths {
         let result = (|| -> Result<String> {
             let transaction =
@@ -1280,7 +1367,59 @@ fn recover_fact_patch_transactions_locked(project_root: &Path) -> Result<FactRec
             }),
         }
     }
+    persist_fact_recovery_report(project_root, &report)?;
     Ok(report)
+}
+
+pub fn latest_fact_recovery_report(project_root: &Path) -> Result<Option<FactRecoveryReport>> {
+    let path = fact_recovery_report_path(project_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+}
+
+fn persist_fact_recovery_report(project_root: &Path, report: &FactRecoveryReport) -> Result<()> {
+    if report.recovered.is_empty() && report.failures.is_empty() {
+        return Ok(());
+    }
+    let unchanged = latest_fact_recovery_report(project_root)
+        .ok()
+        .flatten()
+        .is_some_and(|previous| {
+            previous.recovered == report.recovered && previous.failures == report.failures
+        });
+    if unchanged {
+        return Ok(());
+    }
+    atomic_write(
+        &fact_recovery_report_path(project_root),
+        serde_json::to_string_pretty(report)?.as_bytes(),
+    )?;
+    if !report.recovered.is_empty() {
+        record_event(
+            project_root,
+            AgentEventType::FactPatchRecoveryCompleted,
+            "完成 Fact Patch 事务恢复",
+            serde_json::json!({"patch_ids":report.recovered,"count":report.recovered.len()}),
+        )?;
+    }
+    if !report.failures.is_empty() {
+        record_event(
+            project_root,
+            AgentEventType::FactPatchRecoveryBlocked,
+            "Fact Patch 事务恢复受阻",
+            serde_json::json!({
+                "count":report.failures.len(),
+                "failures":report.failures.iter().map(|failure| serde_json::json!({
+                    "patch_id":failure.patch_id,
+                    "path":failure.path,
+                    "reason":failure.reason
+                })).collect::<Vec<_>>()
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_recovery_clean(report: FactRecoveryReport) -> Result<()> {
@@ -1567,6 +1706,11 @@ pub fn reconcile_knowledge(
 
     for fact in &facts {
         let verification = verify_fact(project_root, fact);
+        let expired = fact
+            .valid_until
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|value| value < Utc::now());
         let all_evidence_missing = !verification.results.is_empty()
             && verification
                 .results
@@ -1579,7 +1723,15 @@ pub fn reconcile_knowledge(
                     | EvidenceVerificationStatus::InvalidLocation
             )
         });
-        if all_evidence_missing {
+        if expired {
+            findings.push(finding(
+                ReconciliationKind::Stale,
+                vec![fact.id.clone()],
+                "事实已经超过有效期限".to_string(),
+                "delete",
+                95,
+            ));
+        } else if all_evidence_missing {
             let reasons = verification
                 .results
                 .iter()
@@ -1617,19 +1769,6 @@ pub fn reconcile_knowledge(
                 format!("事实证据发生漂移，需要更新或重新验证：{}", reasons),
                 "update",
                 80,
-            ));
-        } else if fact
-            .valid_until
-            .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .is_some_and(|value| value < Utc::now())
-        {
-            findings.push(finding(
-                ReconciliationKind::Stale,
-                vec![fact.id.clone()],
-                "事实已经超过有效期限".to_string(),
-                "delete",
-                95,
             ));
         }
     }
@@ -1844,6 +1983,10 @@ fn fact_patches_dir(project_root: &Path) -> PathBuf {
 
 fn fact_transactions_dir(project_root: &Path) -> PathBuf {
     memory_dir(project_root).join("fact-transactions")
+}
+
+fn fact_recovery_report_path(project_root: &Path) -> PathBuf {
+    memory_dir(project_root).join("latest-fact-recovery.json")
 }
 
 fn fact_patch_path(project_root: &Path, patch_id: &str) -> PathBuf {
@@ -2364,6 +2507,7 @@ fn append_evidence_verification_with_limit(
     archive_limit: usize,
 ) -> Result<()> {
     let path = evidence_verifications_path(project_root);
+    repair_evidence_verification_tail(&path)?;
     let record = EvidenceVerificationRecord {
         id: item_id("evidence_verification", &report.fact_id, &report.checked_at),
         fact_id: report.fact_id.clone(),
@@ -2388,6 +2532,31 @@ fn append_evidence_verification_with_limit(
     }
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     file.write_all(&line)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn repair_evidence_verification_tail(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read(path)?;
+    if content.is_empty() || content.ends_with(b"\n") {
+        return Ok(());
+    }
+    let tail_start = content
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let tail = &content[tail_start..];
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    if serde_json::from_slice::<EvidenceVerificationRecord>(tail).is_ok() {
+        file.seek(std::io::SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+    } else {
+        file.set_len(tail_start as u64)?;
+    }
     file.sync_all()?;
     Ok(())
 }
@@ -2710,6 +2879,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_fact_takes_precedence_over_evidence_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("evidence.txt"), "当前内容").unwrap();
+        let mut item = fact("one", "已经到期的事实");
+        item.valid_until = Some("2020-01-01T00:00:00Z".to_string());
+        item.evidence_details = vec![FactEvidence {
+            path: "evidence.txt".to_string(),
+            symbol: None,
+            line_start: None,
+            line_end: None,
+            content_hash: Some("sha256:outdated".to_string()),
+            hash_scope: Some(EvidenceHashScope::File),
+            git_head: None,
+            captured_at: item.created_at.clone(),
+            verified_at: item.last_verified_at.clone(),
+            evidence_type: "file".to_string(),
+        }];
+        seed(&temp, &[item]);
+
+        let reconciliation = reconcile_knowledge(temp.path(), None).unwrap();
+        assert_eq!(reconciliation.stale_count, 1);
+        assert_eq!(reconciliation.drift_count, 0);
+        assert_eq!(reconciliation.findings[0].recommended_operation, "delete");
+        assert!(reconciliation.findings[0].reason.contains("有效期限"));
+    }
+
+    #[test]
     fn evidence_verification_rejects_paths_outside_project() {
         let temp = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
@@ -2809,6 +3005,14 @@ mod tests {
             FactPatchStatus::Applied
         );
         assert!(!fact_transaction_path(temp.path(), &patch.id).exists());
+        let latest = latest_fact_recovery_report(temp.path()).unwrap().unwrap();
+        assert_eq!(latest.recovered, vec![patch.id.clone()]);
+        assert!(latest.failures.is_empty());
+        let events = cyclaw_events::read_events(temp.path()).unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == AgentEventType::FactPatchRecoveryCompleted
+                && event.data["patch_ids"][0] == patch.id
+        }));
     }
 
     #[test]
@@ -2843,6 +3047,21 @@ mod tests {
         assert_eq!(report.failures.len(), 1);
         assert!(report.failures[0].reason.contains("无法安全恢复"));
         assert!(fact_transaction_path(temp.path(), &patch.id).exists());
+        let event_count = cyclaw_events::read_events(temp.path())
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == AgentEventType::FactPatchRecoveryBlocked)
+            .count();
+        assert_eq!(event_count, 1);
+
+        let repeated = recover_fact_patch_transactions(temp.path()).unwrap();
+        assert_eq!(repeated.failures.len(), 1);
+        let repeated_event_count = cyclaw_events::read_events(temp.path())
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == AgentEventType::FactPatchRecoveryBlocked)
+            .count();
+        assert_eq!(repeated_event_count, 1);
     }
 
     #[test]
@@ -3066,6 +3285,47 @@ mod tests {
         let records = list_evidence_verifications(temp.path(), Some("one"), 0, 20).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].checked_at, "2026-08-04T12:00:04Z");
+    }
+
+    #[test]
+    fn evidence_verification_ledger_recovers_incomplete_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        seed(&temp, &[fact("one", "需要验证")]);
+        verify_fact_evidence(temp.path(), "one").unwrap();
+        let path = evidence_verifications_path(temp.path());
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"partial\":")
+            .unwrap();
+
+        let damaged = query_evidence_verifications(temp.path(), Some("one"), 0, 20).unwrap();
+        assert_eq!(damaged.records.len(), 1);
+        assert_eq!(damaged.issues.len(), 1);
+        assert_eq!(damaged.issues[0].line, 2);
+
+        verify_fact_evidence(temp.path(), "one").unwrap();
+        let repaired = query_evidence_verifications(temp.path(), Some("one"), 0, 20).unwrap();
+        assert_eq!(repaired.records.len(), 2);
+        assert!(repaired.issues.is_empty());
+    }
+
+    #[test]
+    fn evidence_verification_archive_rejects_corrupted_complete_line() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_memory_dirs(temp.path()).unwrap();
+        let archive_dir = evidence_verifications_archive_dir(temp.path());
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(
+            archive_dir.join("evidence-verifications-20200101.jsonl"),
+            "{broken}\n",
+        )
+        .unwrap();
+
+        let error = query_evidence_verifications(temp.path(), None, 0, 20).unwrap_err();
+        assert!(error.to_string().contains("账本损坏"));
+        assert!(error.to_string().contains(":1:"));
     }
 
     #[test]
