@@ -9,7 +9,8 @@ use cyclaw_core::{
     FactPatchRequest, FactPatchStatus, FactType, ProjectFact, SearchOptions,
     apply_document_patch as apply_patch, apply_fact_patch as apply_fact_patch_core,
     begin_task as begin_project_task, checkpoint_task as checkpoint_project_task,
-    close_task as close_project_task, generate_document_drafts,
+    close_task as close_project_task,
+    diagnose_fact_patch_transactions as core_diagnose_fact_transactions, generate_document_drafts,
     get_active_task as core_get_active_task,
     get_latest_reconciliation as core_get_latest_reconciliation,
     get_task_context as core_get_task_context, list_document_patches,
@@ -54,7 +55,8 @@ where
     W: Write,
 {
     let mut transport = McpTransport::new(reader);
-    recover_fact_transactions(&options.project_root)?;
+    // 坏事务由 doctor 报告，不能阻止 MCP 启动和只读诊断。
+    let _ = recover_fact_transactions(&options.project_root)?;
     let server = McpServer::new(options.project_root);
 
     while let Some(request) = transport.next_message()? {
@@ -193,6 +195,7 @@ impl McpServer {
             json!({"name":"revert_fact_patch","description":"撤销指定已应用事实草稿；仅在应用后事实未变化时执行。","inputSchema":object_schema_with_required(vec![("patch_id",json!({"type":"string"}))], &["patch_id"])}),
             json!({"name":"verify_fact_evidence","description":"验证结构化事实证据并追加独立验证账本，不修改 Fact Ledger。","inputSchema":object_schema_with_required(vec![("fact_id",json!({"type":"string"}))], &["fact_id"])}),
             json!({"name":"list_evidence_verifications","description":"分页读取独立事实证据验证记录。","inputSchema":object_schema(vec![("fact_id",json!({"type":"string"})),("offset",json!({"type":"integer","minimum":0})),("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
+            json!({"name":"list_fact_transactions","description":"只读诊断待恢复的 Fact Patch 事务，不修改账本。","inputSchema":object_schema(vec![])}),
             fact_operation_tool("create_fact", "生成新增事实草稿", false, false),
             fact_operation_tool("update_fact", "生成更新事实草稿", true, false),
             fact_operation_tool("merge_facts", "生成合并事实草稿", true, true),
@@ -207,7 +210,7 @@ impl McpServer {
             json!({"name":"record_decision","description":"把任务中的关键决策写入任务记录和结构化 Fact Ledger。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("statement",json!({"type":"string"})),("rationale",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}})),("confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
             json!({"name":"record_failed_approach","description":"记录尝试过但失败的方案、原因和证据，供后续会话避免重复。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("approach",json!({"type":"string"})),("reason",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}}))])}),
             json!({"name":"checkpoint_task","description":"记录长任务检查点、当前结论和相关文件。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("summary",json!({"type":"string"})),("related_files",json!({"type":"array","items":{"type":"string"}}))])}),
-            json!({"name":"reconcile_project_knowledge","description":"检测结构化事实中的重复、冲突和失效证据，并推荐 merge/supersede/delete。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"}))])}),
+            json!({"name":"reconcile_project_knowledge","description":"检测结构化事实中的重复、冲突、证据漂移和失效，并推荐 merge/supersede/update/delete。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"}))])}),
             json!({"name":"close_task","description":"关闭当前任务，可同时执行知识对账并返回交接信息。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("summary",json!({"type":"string"})),("reconcile",json!({"type":"boolean"}))])}),
             json!({"name":"list_project_facts","description":"读取结构化项目事实，可按状态限制数量。","inputSchema":object_schema(vec![("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
             json!({"name":"list_tasks","description":"读取最近项目任务记录。","inputSchema":object_schema(vec![("limit",json!({"type":"integer","minimum":1,"maximum":100}))])}),
@@ -245,6 +248,7 @@ impl McpServer {
                     | "get_candidate_detail"
                     | "list_fact_patches"
                     | "list_evidence_verifications"
+                    | "list_fact_transactions"
                     | "doctor"
             );
             if let Some(object) = tool.as_object_mut() {
@@ -291,6 +295,7 @@ impl McpServer {
             "revert_fact_patch" => self.revert_fact_patch(arguments)?,
             "verify_fact_evidence" => self.verify_fact_evidence(arguments)?,
             "list_evidence_verifications" => self.list_evidence_verifications(arguments)?,
+            "list_fact_transactions" => self.list_fact_transactions()?,
             "create_fact" => self.fact_operation(FactOperation::Create, arguments)?,
             "update_fact" => self.fact_operation(FactOperation::Update, arguments)?,
             "merge_facts" => self.fact_operation(FactOperation::Merge, arguments)?,
@@ -702,6 +707,12 @@ impl McpServer {
         Ok(json!({"records":records}))
     }
 
+    fn list_fact_transactions(&self) -> Result<Value> {
+        Ok(serde_json::to_value(core_diagnose_fact_transactions(
+            &self.project_root,
+        )?)?)
+    }
+
     fn fact_operation(&self, operation: FactOperation, arguments: Value) -> Result<Value> {
         let target_fact_id = arguments
             .get("target_fact_id")
@@ -843,6 +854,7 @@ impl McpServer {
         let status = project_status(self.project_root.clone())?;
         let policy = load_or_default(&self.project_root)?;
         let providers = list_providers(self.project_root.clone())?;
+        let transactions = core_diagnose_fact_transactions(&self.project_root)?;
         let checks = vec![
             json!({"name":"git_repository","ok":self.project_root.join(".git").exists()}),
             json!({"name":"cyclaw_initialized","ok":status.initialized}),
@@ -850,6 +862,14 @@ impl McpServer {
             json!({"name":"knowledge_inbox","ok":status.inbox_exists}),
             json!({"name":"active_model","ok":providers.active_provider.is_some()}),
             json!({"name":"docs_write_permission","ok":policy.permissions.allow_docs_apply}),
+            json!({
+                "name":"fact_transactions",
+                "ok":transactions.blocked_count == 0,
+                "pending":transactions.pending_count,
+                "recoverable":transactions.recoverable_count,
+                "blocked":transactions.blocked_count,
+                "details":transactions.transactions
+            }),
         ];
         let healthy = checks
             .iter()
@@ -1413,6 +1433,7 @@ mod tests {
         assert!(text.contains("record_failed_approach"));
         assert!(text.contains("reconcile_project_knowledge"));
         assert!(text.contains("list_evidence_verifications"));
+        assert!(text.contains("list_fact_transactions"));
         assert!(text.contains("doctor"));
     }
 
@@ -1457,6 +1478,45 @@ mod tests {
 
         assert_eq!(result["healthy"], false);
         assert!(result["checks"].is_array());
+    }
+
+    #[test]
+    fn doctor_reports_blocked_fact_transaction_without_preventing_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".cyclaw/memory/fact-transactions");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("fact_patch_blocked.json"),
+            r#"{"patch_id":"fact_patch_blocked","operation":"apply","started_at":"2026-08-04T00:00:00Z","before_fingerprint":"before","after_fingerprint":"after"}"#,
+        )
+        .unwrap();
+        let server = McpServer::new(temp.path().to_path_buf());
+
+        let result = server.doctor().unwrap();
+        let transaction_check = result["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "fact_transactions")
+            .unwrap();
+        assert_eq!(transaction_check["ok"], false);
+        assert_eq!(transaction_check["blocked"], 1);
+
+        let input = framed(json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize","params":{}
+        }));
+        let mut output = Vec::new();
+        run_server(
+            McpServerOptions::new(temp.path().to_path_buf()),
+            input.as_bytes(),
+            &mut output,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("protocolVersion")
+        );
     }
 
     #[test]

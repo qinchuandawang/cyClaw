@@ -13,12 +13,13 @@ use cyclaw_core::{
     FactPatchQuery, FactPatchRequest, FactPatchStatus, FactType, InboxGenerateOptions, InitOptions,
     ProjectFact, ScanOptions, SearchOptions, analyze_project_diff, apply_document_patch,
     apply_fact_patch, begin_task, checkpoint_task, close_task, current_change_snapshot,
-    generate_document_drafts, generate_inbox, get_active_task, get_latest_reconciliation,
-    get_task_context, index_project, init_project, list_document_patches,
-    list_evidence_verifications, list_inbox, list_project_facts, list_tasks, preview_fact_patch,
-    project_fact_from_input, project_status, query_fact_patches, reconcile_project_knowledge,
-    record_task_decision, record_task_failed_approach, revert_document_patch, revert_fact_patch,
-    scan_project, search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
+    diagnose_fact_patch_transactions, generate_document_drafts, generate_inbox, get_active_task,
+    get_latest_reconciliation, get_task_context, index_project, init_project,
+    list_document_patches, list_evidence_verifications, list_inbox, list_project_facts, list_tasks,
+    preview_fact_patch, project_fact_from_input, project_status, query_fact_patches,
+    reconcile_project_knowledge, record_task_decision, record_task_failed_approach,
+    revert_document_patch, revert_fact_patch, scan_project, search_project, update_inbox_status,
+    verify_fact_evidence, watch_project_once,
 };
 use cyclaw_docs::KnowledgeOperation;
 use cyclaw_knowledge::{KnowledgeImportance, KnowledgeStatus};
@@ -351,6 +352,11 @@ enum FactCommand {
         offset: usize,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 只读诊断待恢复的事实事务
+    Transactions {
         #[arg(short, long)]
         path: Option<PathBuf>,
     },
@@ -1050,6 +1056,20 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            FactCommand::Transactions { path } => {
+                let diagnostics = diagnose_fact_patch_transactions(&resolve_path(path)?)?;
+                println!("待恢复事务: {}", diagnostics.pending_count);
+                println!("可恢复: {}", diagnostics.recoverable_count);
+                println!("阻塞: {}", diagnostics.blocked_count);
+                for transaction in diagnostics.transactions {
+                    println!(
+                        "{} {:?} {}",
+                        transaction.patch_id.as_deref().unwrap_or("未知 Patch"),
+                        transaction.status,
+                        transaction.reason
+                    );
+                }
+            }
             FactCommand::Apply { id, path } => {
                 let patch = apply_fact_patch(&resolve_path(path)?, &id)?;
                 println!(
@@ -1399,6 +1419,7 @@ fn main() -> Result<()> {
                 println!("重复: {}", report.duplicate_count);
                 println!("冲突: {}", report.conflict_count);
                 println!("失效: {}", report.stale_count);
+                println!("证据漂移: {}", report.drift_count);
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
             TaskCommand::Close {
@@ -1996,5 +2017,17 @@ mod tests {
         let paths = staged_git_paths(repository.path()).expect("应能读取 staged 文件");
         assert!(paths.contains("staged.rs"));
         assert!(!paths.contains("unstaged.rs"));
+    }
+
+    #[test]
+    fn parses_fact_transactions_command() {
+        let cli = Cli::try_parse_from(["cyclaw", "fact", "transactions", "--path", "."])
+            .expect("应能解析事实事务诊断命令");
+        assert!(matches!(
+            cli.command,
+            Commands::Fact {
+                command: FactCommand::Transactions { .. }
+            }
+        ));
     }
 }

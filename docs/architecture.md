@@ -23,10 +23,10 @@ radar        memory       docs/retrieval
 
 | 模块 | 职责 |
 | --- | --- |
-| `cyclaw-cli` | 命令行入口、任务命令、Fact 五种治理快捷命令、证据验证历史、Fact Patch 过滤分页、Watch 和本地 MCP 服务启动。 |
-| `cyclaw-core` | 项目生命周期、上下文编译、Fact Patch 与文档 Patch 治理编排。 |
-| `cyclaw-memory` | Task Record、Fact Ledger、跨文件事务恢复、结构化证据验证账本、跨任务召回和知识对账。 |
-| `cyclaw-mcp` | 面向 Coding Agent 的本地 stdio JSON-RPC 接口，所有事实写入复用 Core，并为事实工具声明严格 Schema。 |
+| `cyclaw-cli` | 命令行入口、任务命令、Fact 五种治理快捷命令、证据验证历史、事务诊断、Fact Patch 过滤分页、Watch 和本地 MCP 服务启动。 |
+| `cyclaw-core` | 项目生命周期、上下文编译、Fact Patch 与文档 Patch 治理编排，并统一暴露事务恢复诊断。 |
+| `cyclaw-memory` | Task Record、Fact Ledger、跨文件事务恢复与诊断、结构化证据验证账本、跨任务召回和知识对账。 |
+| `cyclaw-mcp` | 面向 Coding Agent 的本地 stdio JSON-RPC 接口，所有事实写入复用 Core，并通过 `doctor` 和 `list_fact_transactions` 暴露只读事务诊断。 |
 | `cyclaw-policy` | 文档写入、模型联网、自动化、路径和 Shell 权限。 |
 | `cyclaw-events` | 追加式审计事件。 |
 | `cyclaw-change-radar` | 文件事件、Git 快照和变更分类。 |
@@ -34,9 +34,11 @@ radar        memory       docs/retrieval
 | `cyclaw-retrieval` | SQLite FTS5 索引、字面量安全查询和项目知识检索。 |
 | `cyclaw-model` | OpenAI-compatible Provider 配置、限流、重试和缓存。 |
 
-Fact Patch 在应用和撤销前先写入 `.cyclaw/memory/fact-transactions/` 事务日志，并进入 `applying` 或 `reverting` 中间状态。MCP 启动、草稿列表及后续治理操作会恢复中断事务：账本匹配操作前快照时幂等重放，匹配操作后快照时补齐 Patch 状态；两者都不匹配则拒绝恢复，避免覆盖并发修改。
+Fact 与 Fact Patch ID 在存储层执行长度、字符集和前缀校验，Patch 与事务文件还会校验文件名和内部 ID 一致，防止外部接口输入形成路径穿越。Fact Patch 在应用和撤销前先写入 `.cyclaw/memory/fact-transactions/` 事务日志，并进入 `applying` 或 `reverting` 中间状态。恢复过程逐条隔离事务：账本匹配操作前快照时幂等重放，匹配操作后快照时补齐 Patch 状态；两者都不匹配或日志损坏时保留原日志并报告阻塞，不影响 MCP 启动和只读诊断。写操作会在存在阻塞事务时拒绝继续，避免覆盖并发修改。
 
-证据验证结果追加到 `.cyclaw/memory/evidence-verifications.jsonl`，不会修改 Fact 本体。`FactEvidence.hash_scope` 支持 `file`、`line_range` 和 `symbol`；文件级 SHA-256 采用流式读取，单个证据文件默认限制为 16 MiB。FTS5 查询会先转换为安全字面量词项，解析类错误降级到转义 LIKE，其他数据库错误继续向调用方返回。
+证据验证结果追加到 `.cyclaw/memory/evidence-verifications.jsonl`，不会修改 Fact 本体。主账本达到 4 MiB 时滚动到 `.cyclaw/memory/evidence-verifications/`，默认保留最近 12 个归档；查询会联合主账本与归档并按验证时间分页。`FactEvidence.hash_scope` 支持 `file`、`line_range` 和 `symbol`；文件级 SHA-256 采用流式读取，单个证据文件默认限制为 16 MiB。
+
+知识对账区分证据消失和证据漂移：只有全部可验证证据缺失或 `valid_until` 到期才产生 `stale/delete` 建议；`hash_mismatch` 和 `invalid_location` 产生 `evidence_drift/update` 建议；`outside_project`、`unsupported` 和 `too_large` 不触发破坏性建议。VS Code 同步展示漂移计数。FTS5 查询会先转换为安全字面量词项，解析类错误降级到转义 LIKE，其他数据库错误继续向调用方返回。
 
 ## 数据边界
 

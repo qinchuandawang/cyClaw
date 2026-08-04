@@ -111,9 +111,10 @@ interface ReconciliationReport {
   duplicate_count: number;
   conflict_count: number;
   stale_count: number;
+  drift_count: number;
   findings: Array<{
     id: string;
-    kind: "duplicate" | "conflict" | "stale";
+    kind: "duplicate" | "conflict" | "stale" | "evidence_drift";
     reason: string;
     recommended_operation: string;
     confidence: number;
@@ -832,7 +833,7 @@ async function reconcileKnowledge(provider: CyclawKnowledgeProvider): Promise<vo
     );
     await refresh(provider);
     vscode.window.showInformationMessage(
-      `知识对账完成：重复 ${value.report.duplicate_count}，冲突 ${value.report.conflict_count}，失效 ${value.report.stale_count}`
+      `知识对账完成：重复 ${value.report.duplicate_count}，冲突 ${value.report.conflict_count}，失效 ${value.report.stale_count}，证据漂移 ${value.report.drift_count ?? 0}`
     );
   } catch (error) {
     vscode.window.showErrorMessage(`知识对账失败：${error instanceof Error ? error.message : String(error)}`);
@@ -1601,7 +1602,7 @@ function renderDashboardHtml(snapshot: KnowledgeSnapshot, context: vscode.Extens
 </section>`;
   const reconciliation = snapshot.reconciliation;
   const reconciliationNotice = reconciliation && reconciliation.findings.length > 0 ? `
-<div class="memory-alert"><strong>最近知识对账</strong><span>重复 ${reconciliation.duplicate_count} · 冲突 ${reconciliation.conflict_count} · 失效 ${reconciliation.stale_count}</span></div>` : "";
+<div class="memory-alert"><strong>最近知识对账</strong><span>重复 ${reconciliation.duplicate_count} · 冲突 ${reconciliation.conflict_count} · 失效 ${reconciliation.stale_count} · 漂移 ${reconciliation.drift_count ?? 0}</span></div>` : "";
   const events = snapshot.events.slice(0, 6).map((event) => `
     <li><span class="event-mark ${escapeHtml(event.event_type)}"></span><span class="event-text">${escapeHtml(event.summary)}</span><time>${new Date(event.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time></li>`).join("");
   const error = snapshot.error ? `<div class="notice error"><strong>cyClaw 暂不可用</strong><span>${escapeHtml(snapshot.error)}</span></div>` : "";

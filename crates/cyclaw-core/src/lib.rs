@@ -20,14 +20,17 @@ use cyclaw_knowledge::{
 pub use cyclaw_memory::{
     BeginTaskOptions, EvidenceHashScope, EvidenceVerificationRecord, EvidenceVerificationStatus,
     FactContext, FactEvidence, FactEvidenceVerification, FactInput, FactOperation, FactPatch,
-    FactPatchPage, FactPatchQuery, FactPatchRequest, FactPatchStatus, FactType,
-    FactVerificationReport, FailedApproach, ProjectFact, ReconciliationReport, TaskCheckpoint,
-    TaskDecision, TaskRecord,
+    FactPatchPage, FactPatchQuery, FactPatchRequest, FactPatchStatus, FactRecoveryFailure,
+    FactRecoveryReport, FactTransactionDiagnostic, FactTransactionDiagnosticStatus,
+    FactTransactionDiagnostics, FactType, FactVerificationReport, FailedApproach, ProjectFact,
+    ReconciliationReport, TaskCheckpoint, TaskDecision, TaskRecord,
 };
 use cyclaw_memory::{
     apply_fact_patch as memory_apply_fact_patch, begin_task as memory_begin_task,
     checkpoint_task as memory_checkpoint_task, close_task as memory_close_task,
-    compile_fact_context, get_active_task as memory_active_task, get_task as memory_get_task,
+    compile_fact_context,
+    diagnose_fact_patch_transactions as memory_diagnose_fact_patch_transactions,
+    get_active_task as memory_active_task, get_task as memory_get_task,
     latest_reconciliation as memory_latest_reconciliation,
     list_evidence_verifications as memory_list_evidence_verifications,
     list_fact_patches as memory_list_fact_patches, list_facts as memory_list_facts,
@@ -936,8 +939,12 @@ pub fn list_fact_patches(project_root: &Path) -> Result<Vec<FactPatch>> {
     memory_list_fact_patches(project_root)
 }
 
-pub fn recover_fact_patch_transactions(project_root: &Path) -> Result<Vec<String>> {
+pub fn recover_fact_patch_transactions(project_root: &Path) -> Result<FactRecoveryReport> {
     memory_recover_fact_patch_transactions(project_root)
+}
+
+pub fn diagnose_fact_patch_transactions(project_root: &Path) -> Result<FactTransactionDiagnostics> {
+    memory_diagnose_fact_patch_transactions(project_root)
 }
 
 pub fn query_fact_patches(project_root: &Path, query: FactPatchQuery) -> Result<FactPatchPage> {
