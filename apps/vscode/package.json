@@ -316,7 +316,7 @@
     "check": "tsc --noEmit -p ./"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^26.2.0",
     "@types/vscode": "1.92.0",
     "typescript": "^5.7.0"
   }
