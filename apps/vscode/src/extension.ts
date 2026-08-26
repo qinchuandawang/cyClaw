@@ -139,13 +139,7 @@ interface PolicySnapshot {
   permissions: {
     allow_model_call: boolean;
     allow_network: boolean;
-    allow_shell: boolean;
-    allow_code_write: boolean;
     allow_docs_apply: boolean;
-    allow_auto_apply_docs: boolean;
-  };
-  automation: {
-    auto_apply_min_confidence: number;
   };
 }
 
@@ -167,7 +161,7 @@ interface ModelSecretBinding {
   apiKeyEnv: string;
 }
 
-type PermissionAction = "docs" | "model" | "autoDocs" | "shell" | "code";
+type PermissionAction = "docs" | "model" | "autoDocs";
 
 class CyclawTreeItem extends vscode.TreeItem {
   constructor(
@@ -307,13 +301,8 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
     const permissions = this.snapshot.policy?.permissions;
     const candidateCount = this.snapshot.candidates.length;
     const patchCount = this.snapshot.patches.length;
-    const autoDocs = Boolean(
-      permissions?.allow_docs_apply && permissions.allow_auto_apply_docs
-    );
     const children = [
-      commandLeaf("立即检查项目变更", "sync", "cyclaw.watchOnce", "检查一次项目变更"),
-      commandLeaf("运行一次知识 Agent", "sparkle", "cyclaw.runAgent", "运行一次 cyClaw Agent"),
-      commandLeaf("批量处理知识候选", "checklist", "cyclaw.batchCandidates", "批量处理知识候选"),
+      commandLeaf("执行观察器补偿", "sync", "cyclaw.watchOnce", "执行一次独立 Observer 补偿"),
       commandLeaf("查看运行日志", "output", "cyclaw.showOutput", "打开并聚焦 cyClaw 运行日志"),
       leaf(`事件监听：${watchProcess ? "运行中" : "已停止"}`, watchProcess ? "radio-tower" : "debug-stop"),
       leaf(
@@ -321,8 +310,8 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
         candidateCount || patchCount ? "warning" : "pass"
       ),
       leaf(
-        autoDocs ? "自动文档管理：运行中" : "自动文档管理：需授权",
-        autoDocs ? "zap" : "lock"
+        "文档修改：仅通过可审计 Patch 审批",
+        "shield"
       )
     ];
     const section = new CyclawTreeItem(
@@ -375,10 +364,7 @@ class CyclawKnowledgeProvider implements vscode.TreeDataProvider<CyclawTreeItem>
         true
       ),
       permissionLeaf("文档写入", "允许将已确认的文档草稿写入 docs。点击切换。", permissions?.allow_docs_apply, "docs"),
-      permissionLeaf("模型 API 与联网", "允许使用 API Key 调用模型服务。点击切换。", Boolean(permissions?.allow_model_call && permissions?.allow_network), "model"),
-      permissionLeaf("自动管理文档", "高风险：自动生成并写入 docs，不再等待人工确认；需要同时开启文档写入。默认关闭。", Boolean(permissions?.allow_docs_apply && permissions?.allow_auto_apply_docs), "autoDocs"),
-      permissionLeaf("Shell 自动化", "允许 Agent 执行 Shell 自动化命令。点击切换。", permissions?.allow_shell, "shell"),
-      permissionLeaf("源码写入", "允许 Agent 写入源码，风险较高。点击切换。", permissions?.allow_code_write, "code")
+      permissionLeaf("模型 API 与联网", "允许使用 API Key 调用模型服务。点击切换。", Boolean(permissions?.allow_model_call && permissions?.allow_network), "model")
     ];
     const section = new CyclawTreeItem(
       "权限控制",
@@ -564,8 +550,8 @@ export function activate(context: vscode.ExtensionContext): void {
   extensionRoot = context.extensionPath;
   outputChannel = vscode.window.createOutputChannel("cyClaw");
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 20);
-  statusBarItem.command = "cyclaw.runAgent";
-  statusBarItem.tooltip = "运行 cyClaw Agent 并刷新项目知识状态";
+  statusBarItem.command = "cyclaw.watchOnce";
+  statusBarItem.tooltip = "执行一次 cyClaw Observer 补偿并刷新项目知识状态";
   statusBarItem.show();
   const provider = new CyclawKnowledgeProvider();
   const dashboard = new CyclawDashboardProvider(context);
@@ -589,7 +575,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("cyclaw.init", () => runCliCommand(["init"]).then(() => refresh(provider))),
     vscode.commands.registerCommand("cyclaw.scan", () => runCliCommand(["scan"]).then(() => refresh(provider))),
     vscode.commands.registerCommand("cyclaw.watchOnce", () =>
-      runCliCommand(["watch", "--once", "--interval", "0"]).then(() => refresh(provider))
+      runCliCommand(["observer", "run", "--once"]).then(() => refresh(provider))
     ),
     vscode.commands.registerCommand("cyclaw.startWatch", () => startWatch(provider)),
     vscode.commands.registerCommand("cyclaw.stopWatch", () => stopWatch(provider)),
@@ -947,9 +933,6 @@ async function configurePermissions(provider: CyclawKnowledgeProvider): Promise<
       { label: "本地知识维护", description: "读取项目并写入 .cyclaw，本地基础能力", detail: "始终启用", action: "info" },
       { label: `文档写入：${permissionLabel(permissions.allow_docs_apply)}`, description: "允许将已确认的草稿写入 docs", action: "docs" },
       { label: `模型 API 与联网：${permissionLabel(permissions.allow_model_call && permissions.allow_network)}`, description: "允许使用 API Key 调用模型服务", action: "model" },
-      { label: `自动管理文档：${permissionLabel(permissions.allow_auto_apply_docs)}`, description: "Agent 自动生成并应用文档，不再等待确认", detail: "高风险权限", action: "autoDocs" },
-      { label: `Shell 自动化：${permissionLabel(permissions.allow_shell)}`, description: "允许执行 Shell 自动化命令", action: "shell" },
-      { label: `源码写入：${permissionLabel(permissions.allow_code_write)}`, description: "允许 Agent 写入源码，风险最高", action: "code" }
     ];
     const selected = await vscode.window.showQuickPick(choices, { placeHolder: "高级权限：逐项调整运行策略底层的能力开关" });
     if (!selected || selected.action === "info") return;
@@ -961,37 +944,16 @@ async function configurePermissions(provider: CyclawKnowledgeProvider): Promise<
 
 async function configureMode(provider: CyclawKnowledgeProvider): Promise<void> {
   const selected = await vscode.window.showQuickPick([
-    { label: "观察模式", description: "只检测和收集，不调用模型，不写入项目文档", mode: "observe" },
+    { label: "观察模式", description: "独立 Observer 持续采集事件，不调用模型，不写入项目文档", mode: "observe" },
     { label: "审阅模式", description: "生成候选和草稿，由用户确认后写入文档", mode: "review" },
-    { label: "智能审阅", description: "使用活动模型审查候选，文档仍需用户确认", mode: "smart" },
-    { label: "自动文档", description: "使用模型并自动写入 docs，不再逐次确认", detail: "高风险", mode: "auto" }
+    { label: "智能审阅", description: "使用活动模型审查候选，文档仍需用户确认", mode: "smart" }
   ], { placeHolder: "选择运行策略：cyClaw 会自动配置对应的底层权限" });
   if (!selected) return;
-  if (selected.mode === "auto") {
-    const confirmed = await vscode.window.showWarningMessage(
-      "自动文档模式会直接修改当前项目 docs/ 下的文档，是否继续？",
-      { modal: true },
-      "启用自动文档"
-    );
-    if (confirmed !== "启用自动文档") return;
-    const threshold = await vscode.window.showInputBox({
-      prompt: "自动写入文档所需的最低置信度",
-      value: "90",
-      validateInput: (value) => {
-        const number = Number(value);
-        return Number.isInteger(number) && number >= 0 && number <= 100 ? undefined : "请输入 0-100 的整数";
-      }
-    });
-    if (!threshold) return;
-    await runCliCommand(["policy", "set-auto-threshold", threshold]);
-  }
   const docs = selected.mode !== "observe";
-  const model = selected.mode === "smart" || selected.mode === "auto";
-  const autoDocs = selected.mode === "auto";
+  const model = selected.mode === "smart";
   await runCliCommand(["policy", "set", "allow_docs_apply", `--enabled=${docs}`]);
   await runCliCommand(["policy", "set", "allow_model_call", `--enabled=${model}`]);
   await runCliCommand(["policy", "set", "allow_network", `--enabled=${model}`]);
-  await runCliCommand(["policy", "set", "allow_auto_apply_docs", `--enabled=${autoDocs}`]);
   await refresh(provider);
   vscode.window.showInformationMessage(`cyClaw 运行策略已切换为${selected.label}。`);
 }
@@ -1034,10 +996,9 @@ function resolveMode(
 ): string {
   if (!permissions) return "读取中";
   const modelEnabled = permissions.allow_model_call && permissions.allow_network;
-  if (permissions.allow_auto_apply_docs && permissions.allow_docs_apply && modelEnabled && hasModel) return "自动文档";
-  if (!permissions.allow_auto_apply_docs && permissions.allow_docs_apply && modelEnabled && hasModel) return "智能审阅";
-  if (!permissions.allow_auto_apply_docs && permissions.allow_docs_apply && !modelEnabled) return "审阅模式";
-  if (!permissions.allow_auto_apply_docs && !permissions.allow_docs_apply && !modelEnabled) return "观察模式";
+  if (permissions.allow_docs_apply && modelEnabled && hasModel) return "智能审阅";
+  if (permissions.allow_docs_apply && !modelEnabled) return "审阅模式";
+  if (!permissions.allow_docs_apply && !modelEnabled) return "观察模式";
   return "自定义权限";
 }
 
@@ -1082,9 +1043,6 @@ function permissionEnabled(action: string, permissions: PolicySnapshot["permissi
   switch (action) {
     case "docs": return !permissions.allow_docs_apply;
     case "model": return !(permissions.allow_model_call && permissions.allow_network);
-    case "autoDocs": return !permissions.allow_auto_apply_docs;
-    case "shell": return !permissions.allow_shell;
-    case "code": return !permissions.allow_code_write;
     default: return false;
   }
 }
@@ -1099,17 +1057,6 @@ async function applyPermissionToggle(action: string, enable: boolean): Promise<v
       await runCliCommand(["policy", "set", "allow_model_call", value]);
       await runCliCommand(["policy", "set", "allow_network", value]);
       return;
-    case "autoDocs":
-      if (enable) {
-        await runCliCommand(["policy", "set", "allow_docs_apply", value]);
-      }
-      await runCliCommand(["policy", "set", "allow_auto_apply_docs", value]);
-      return;
-    case "shell":
-      await runCliCommand(["policy", "set", "allow_shell", value]);
-      return;
-    case "code":
-      await runCliCommand(["policy", "set", "allow_code_write", value]);
   }
 }
 
@@ -1156,9 +1103,7 @@ async function applyPatch(
   }
 }
 
-export function deactivate(): void {
-  stopWatch();
-}
+export function deactivate(): void {}
 
 async function bootstrapWorkspace(provider: CyclawKnowledgeProvider): Promise<void> {
   const root = workspaceRoot();
@@ -1269,8 +1214,8 @@ function updateStatusBar(value: { status: ProjectStatus; candidates: number; pat
   statusBarItem.tooltip = value.activeTask
     ? `当前任务: ${value.activeTask.title}\n目标: ${value.activeTask.objective}\n决策: ${value.activeTask.decisions.length}\n失败方案: ${value.activeTask.failed_approaches.length}`
     : pending > 0
-    ? `项目已连接\n待处理候选知识: ${value.candidates}\n待应用文档草稿: ${value.patches}\n待应用事实草稿: ${value.factPatches}\n点击运行 Agent`
-    : "项目知识状态已同步，点击运行 Agent";
+    ? `项目已连接\n待处理候选知识: ${value.candidates}\n待应用文档草稿: ${value.patches}\n待应用事实草稿: ${value.factPatches}\nObserver 将持续处理新的项目事件`
+    : "项目知识状态已同步，Observer 正在持续观察项目事件";
 }
 
 async function startWatch(provider: CyclawKnowledgeProvider): Promise<void> {
@@ -1287,10 +1232,10 @@ async function startWatch(provider: CyclawKnowledgeProvider): Promise<void> {
   }
 
   const debounce = workspaceConfiguration(root).get<number>("watchDebounceMilliseconds", 600);
-  const command = await resolveCommand(["watch", "--debounce-ms", String(debounce)], root);
+  const command = await resolveCommand(["observer", "run", "--debounce-ms", String(debounce)], root);
   watchProcess = cp.spawn(command.file, command.args, { cwd: command.cwd, env: command.env });
   provider.notify();
-  outputChannel.appendLine(`cyClaw 事件驱动 Watch 已启动，合并窗口 ${debounce}ms。`);
+  outputChannel.appendLine(`cyClaw 独立 Observer 已启动，合并窗口 ${debounce}ms。`);
 
   watchProcess.stdout.on("data", (chunk: Buffer) => {
     outputChannel.append(chunk.toString());
@@ -1618,7 +1563,7 @@ ${taskSection}
 ${reconciliationNotice}
 <div class="status-strip"><div class="stat"><strong>${snapshot.candidates.length}</strong><span>待处理候选</span></div><div class="stat"><strong>${snapshot.patches.length}</strong><span>文档草稿</span></div><div class="stat"><strong>${status?.fact_patch_pending ?? 0}</strong><span>事实草稿</span></div><div class="stat"><strong>${status?.git_has_changes ? "有" : "无"}</strong><span>Git 变化</span></div></div>
 <section class="section"><div class="section-head"><h2>运行状态</h2><div class="state"><span class="dot ${watching ? "" : "off"}"></span>${watching ? "事件监听中" : "监听已停止"}</div></div><div class="mode-band"><div><strong>${escapeHtml(mode)}</strong><br><span>${escapeHtml(snapshot.models?.active_provider ? `模型：${snapshot.models.active_provider}` : "本地规则")}</span></div><button class="action" data-command="cyclaw.configureMode">选择策略</button></div></section>
-<section class="section"><div class="section-head"><h2>快捷操作</h2></div><div class="actions"><button class="action primary" data-command="cyclaw.runAgent">运行 Agent</button><button class="action" data-command="cyclaw.watchOnce">检查变化</button><button class="action" data-command="cyclaw.batchCandidates">批量处理</button><button class="action" data-command="cyclaw.configureModel">配置模型</button><button class="action" data-command="cyclaw.configurePermissions">高级权限</button><button class="action" data-command="cyclaw.showOutput">运行日志</button></div></section>
+<section class="section"><div class="section-head"><h2>快捷操作</h2></div><div class="actions"><button class="action primary" data-command="cyclaw.watchOnce">执行观察器补偿</button><button class="action" data-command="cyclaw.configureModel">配置模型</button><button class="action" data-command="cyclaw.configurePermissions">高级权限</button><button class="action" data-command="cyclaw.showOutput">运行日志</button></div></section>
 <section class="section"><div class="section-head"><h2>待处理</h2><span>${snapshot.candidates.length + snapshot.patches.length + (status?.fact_patch_pending ?? 0)} 项</span></div><div class="work-list">${candidates}${patches}${factPatches}${!candidates && !patches && !factPatches ? '<div class="empty">当前知识状态已同步，没有待处理内容。</div>' : ""}</div></section>
 <section class="section"><div class="section-head"><h2>最近活动</h2><span>${snapshot.events.length} 条</span></div>${events ? `<ul class="events">${events}</ul>` : '<div class="empty">等待第一次项目变化。</div>'}</section>
 </main><script nonce="${nonce}">const vscode=acquireVsCodeApi();document.addEventListener('click',(event)=>{const target=event.target.closest('button');if(!target)return;if(target.dataset.command)vscode.postMessage({command:target.dataset.command});if(target.dataset.kind==='candidate')vscode.postMessage({command:'openCandidate',id:target.dataset.id});if(target.dataset.kind==='patch')vscode.postMessage({command:'openPatch',id:target.dataset.id});if(target.dataset.kind==='factPatch')vscode.postMessage({command:'openFactPatch',id:target.dataset.id});});</script></body></html>`;

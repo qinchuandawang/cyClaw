@@ -109,8 +109,20 @@ Write-Host "MCP tools/resources smoke passed"
 
 $pendingJson = Get-Content -Encoding UTF8 -Path (Join-Path $ProjectRoot ".cyclaw/knowledge-inbox.jsonl") | Select-Object -First 1 | ConvertFrom-Json
 cargo run -p cyclaw-cli -- inbox accept $pendingJson.id --path $ProjectRoot
-cargo run -p cyclaw-cli -- draft generate --candidate $pendingJson.id --path $ProjectRoot
-$patchId = "patch_$($pendingJson.id)"
+
+# 前面的批量生成已经创建了草稿，应用时读取实际生成的 Patch ID。
+$patchPath = Get-ChildItem -Path (Join-Path $ProjectRoot ".cyclaw/doc-patches") -Filter "*.json" |
+  ForEach-Object {
+    $patch = Get-Content -Raw -Encoding UTF8 $_.FullName | ConvertFrom-Json
+    if ($patch.candidate_id -eq $pendingJson.id) { $patch }
+  } |
+  Select-Object -First 1
+
+if ($null -eq $patchPath) {
+  throw "expected document patch missing for candidate: $($pendingJson.id)"
+}
+
+$patchId = $patchPath.id
 cargo run -p cyclaw-cli -- draft apply $patchId --path $ProjectRoot
 
 if (-not (Test-Path (Join-Path $ProjectRoot $pendingJson.recommended_doc))) {

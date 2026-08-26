@@ -17,6 +17,14 @@ pub struct KnowledgeCandidate {
     pub reasons: Vec<String>,
     pub recommended_doc: String,
     pub related_files: Vec<String>,
+    /// 原始事件和文件证据；候选在未完成验证前不应直接进入长期知识。
+    #[serde(default)]
+    pub evidence: Vec<CandidateEvidence>,
+    /// 同一事件重复上报时用于去重的稳定键。
+    #[serde(default)]
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub suggested_operation: Option<String>,
     #[serde(default = "default_confidence")]
     pub confidence: u8,
     #[serde(default)]
@@ -38,6 +46,8 @@ fn default_confidence() -> u8 {
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeSourceType {
     ChangeAnalysis,
+    ExecutionFailure,
+    PatchResult,
     TaskSummary,
     Manual,
 }
@@ -54,8 +64,33 @@ pub enum KnowledgeImportance {
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeStatus {
     Pending,
+    Verified,
     Accepted,
     Ignored,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateEvidence {
+    pub kind: String,
+    pub reference: String,
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl KnowledgeStatus {
+    pub fn can_transition_to(&self, next: &Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Pending,
+                Self::Verified | Self::Accepted | Self::Ignored | Self::Superseded
+            ) | (
+                Self::Verified,
+                Self::Accepted | Self::Ignored | Self::Superseded
+            ) | (Self::Accepted, Self::Superseded)
+        ) || self == next
+    }
 }
 
 pub fn candidates_from_change_analysis(
@@ -110,6 +145,13 @@ fn candidate_from_asset(
         reasons: reasons_for_asset(asset, &related_change_types),
         recommended_doc: asset.asset.clone(),
         related_files: asset.related_files.clone(),
+        evidence: vec![CandidateEvidence {
+            kind: "change_analysis".to_string(),
+            reference: source_ref.to_string(),
+            summary: asset.reason.clone(),
+        }],
+        idempotency_key: format!("change:{}", candidate_id(analysis, asset, index)),
+        suggested_operation: None,
         confidence,
         reviewed_by_model: false,
         model_recommendation: None,
@@ -121,10 +163,11 @@ fn candidate_from_asset(
 }
 
 fn confidence_for_importance(importance: &KnowledgeImportance) -> u8 {
+    // 路径分类只用于召回，不能被当作已经验证的项目事实。
     match importance {
-        KnowledgeImportance::High => 90,
-        KnowledgeImportance::Medium => 75,
-        KnowledgeImportance::Low => 55,
+        KnowledgeImportance::High => 70,
+        KnowledgeImportance::Medium => 55,
+        KnowledgeImportance::Low => 40,
     }
 }
 
@@ -263,7 +306,7 @@ mod tests {
         assert_eq!(candidates[0].recommended_doc, "docs/dependencies.md");
         assert_eq!(candidates[0].importance, KnowledgeImportance::Medium);
         assert_eq!(candidates[0].status, KnowledgeStatus::Pending);
-        assert_eq!(candidates[0].confidence, 75);
+        assert_eq!(candidates[0].confidence, 55);
     }
 
     #[test]
@@ -273,5 +316,13 @@ mod tests {
 
         assert_eq!(candidates[0].confidence, 50);
         assert!(!candidates[0].reviewed_by_model);
+        assert!(candidates[0].evidence.is_empty());
+        assert!(candidates[0].idempotency_key.is_empty());
+    }
+
+    #[test]
+    fn candidate_status_rejects_reopening_terminal_candidate() {
+        assert!(!KnowledgeStatus::Ignored.can_transition_to(&KnowledgeStatus::Pending));
+        assert!(KnowledgeStatus::Verified.can_transition_to(&KnowledgeStatus::Accepted));
     }
 }

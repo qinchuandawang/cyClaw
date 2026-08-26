@@ -13,9 +13,13 @@ use cyclaw_docs::{
     DocumentPatch, DocumentPatchOptions, KnowledgeOperation, create_document_patch_with_options,
     mark_applied, mark_reverted, parse_patch, render_patch,
 };
-use cyclaw_events::{AgentEventType, append_event, new_event};
+use cyclaw_events::{
+    AgentEventType, ExecutionEvent, append_event, append_execution_event, new_event, new_id,
+    read_execution_events,
+};
 use cyclaw_knowledge::{
-    KnowledgeCandidate, KnowledgeStatus, candidates_from_change_analysis, parse_jsonl, render_jsonl,
+    CandidateEvidence, KnowledgeCandidate, KnowledgeImportance, KnowledgeSourceType,
+    KnowledgeStatus, candidates_from_change_analysis, parse_jsonl, render_jsonl,
 };
 pub use cyclaw_memory::{
     BeginTaskOptions, EvidenceHashScope, EvidenceVerificationIssue, EvidenceVerificationPage,
@@ -24,7 +28,7 @@ pub use cyclaw_memory::{
     FactPatchRequest, FactPatchStatus, FactRecoveryFailure, FactRecoveryReport,
     FactTransactionDiagnostic, FactTransactionDiagnosticStatus, FactTransactionDiagnostics,
     FactType, FactVerificationReport, FailedApproach, ProjectFact, ReconciliationReport,
-    TaskCheckpoint, TaskDecision, TaskRecord,
+    TaskActivity, TaskCheckpoint, TaskDecision, TaskPhase, TaskRecord,
 };
 use cyclaw_memory::{
     apply_fact_patch as memory_apply_fact_patch, begin_task as memory_begin_task,
@@ -43,7 +47,7 @@ use cyclaw_memory::{
     reconcile_knowledge as memory_reconcile_knowledge, record_decision as memory_record_decision,
     record_failed_approach as memory_record_failed_approach,
     recover_fact_patch_transactions as memory_recover_fact_patch_transactions,
-    revert_fact_patch as memory_revert_fact_patch,
+    revert_fact_patch as memory_revert_fact_patch, set_task_phase as memory_set_task_phase,
     verify_fact_evidence as memory_verify_fact_evidence,
 };
 use cyclaw_policy::{PermissionLevel, acquire_lock, check_write_path, load_or_default};
@@ -147,6 +151,27 @@ pub struct WatchTick {
     pub auto_applied_patches: usize,
 }
 
+/// 独立观察器的持久化游标。它不依赖任何 Coding Agent 的任务或 MCP 调用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverState {
+    pub schema_version: u32,
+    pub started_at: String,
+    pub updated_at: String,
+    pub last_snapshot: Option<GitChangeSnapshot>,
+    pub last_reconciled_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObserverTick {
+    pub initialized: bool,
+    pub scanned: bool,
+    pub indexed: bool,
+    pub watch: WatchTick,
+    pub verified_facts: usize,
+    pub reconciliation: Option<ReconciliationReport>,
+    pub state_path: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct InboxGenerateOptions {
     pub project_root: PathBuf,
@@ -182,6 +207,12 @@ pub struct InboxListResult {
 pub struct InboxUpdateResult {
     pub inbox_path: PathBuf,
     pub candidate: KnowledgeCandidate,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionEventRecordResult {
+    pub duplicate: bool,
+    pub candidate: Option<KnowledgeCandidate>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +320,7 @@ pub struct TaskContextPack {
     pub estimated_tokens: usize,
     pub budget_tokens: usize,
     pub truncated: bool,
+    pub selection_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,29 +339,6 @@ impl SearchOptions {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CyclawConfig {
-    pub schema_version: u32,
-    pub project_root: String,
-    pub created_at: String,
-    pub scan: ScanConfig,
-    pub permissions: PermissionConfig,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ScanConfig {
-    pub ignored_dirs: Vec<String>,
-    pub docs_dir: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PermissionConfig {
-    pub read_scope: String,
-    pub write_scopes: Vec<String>,
-    pub allow_network: bool,
-    pub allow_shell: bool,
-}
-
 pub fn init_project(options: InitOptions) -> Result<InitResult> {
     let project_root = options.project_root;
     ensure_directory(&project_root)?;
@@ -341,7 +350,7 @@ pub fn init_project(options: InitOptions) -> Result<InitResult> {
 
     let config_path = cyclaw_dir.join("config.yaml");
     if !config_path.exists() {
-        let config = default_config(&project_root);
+        let config = cyclaw_policy::default_policy();
         let yaml = serde_yaml::to_string(&config)?;
         fs::write(&config_path, yaml)
             .with_context(|| format!("无法写入配置文件: {}", config_path.display()))?;
@@ -403,7 +412,7 @@ pub fn analyze_project_diff(options: DiffOptions) -> Result<DiffResult> {
         Some(changed_paths) => filter_change_analysis(analysis, changed_paths),
         None => analysis,
     };
-    let run_id = format!("diff-{}", Utc::now().format("%Y%m%d%H%M%S"));
+    let run_id = new_id("diff");
     let run_dir = runs_dir.join(&run_id);
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("无法创建 run 目录: {}", run_dir.display()))?;
@@ -492,6 +501,133 @@ pub fn list_inbox(project_root: PathBuf) -> Result<InboxListResult> {
     })
 }
 
+/// 记录宿主工具上报的执行结果。失败只进入候选缓冲层，绝不直接创建长期 Fact。
+pub fn record_execution_event(
+    project_root: PathBuf,
+    event: ExecutionEvent,
+) -> Result<ExecutionEventRecordResult> {
+    ensure_directory(&project_root)?;
+    let _lock = acquire_lock(&project_root, "execution-events", Duration::from_secs(5))?;
+    if read_execution_events(&project_root)?
+        .iter()
+        .any(|existing| existing.idempotency_key == event.idempotency_key)
+    {
+        return Ok(ExecutionEventRecordResult {
+            duplicate: true,
+            candidate: None,
+        });
+    }
+    append_execution_event(&project_root, &event)?;
+    let failed = event.timed_out || event.exit_code.is_some_and(|code| code != 0);
+    record_event(
+        &project_root,
+        if failed {
+            AgentEventType::ExecutionFailed
+        } else {
+            AgentEventType::ExecutionSucceeded
+        },
+        &event.source,
+        if failed {
+            "记录执行失败事件"
+        } else {
+            "记录执行成功事件"
+        },
+        serde_json::json!({"execution_event_id":event.id,"kind":event.kind,"exit_code":event.exit_code,"timed_out":event.timed_out}),
+    )?;
+    if !failed || event.error_summary.as_deref().is_none_or(str::is_empty) {
+        return Ok(ExecutionEventRecordResult {
+            duplicate: false,
+            candidate: None,
+        });
+    }
+
+    let mut candidates = read_inbox_candidates(&project_root)?;
+    if candidates
+        .iter()
+        .any(|existing| existing.idempotency_key == event.idempotency_key)
+    {
+        return Ok(ExecutionEventRecordResult {
+            duplicate: true,
+            candidate: None,
+        });
+    }
+    let now = Utc::now().to_rfc3339();
+    let candidate = KnowledgeCandidate {
+        id: new_id("kc-failure"),
+        summary: format!("需要复盘失败操作：{}", event.command_summary),
+        source_type: KnowledgeSourceType::ExecutionFailure,
+        source_ref: format!(".cyclaw/execution-events.jsonl#{}", event.id),
+        importance: KnowledgeImportance::Medium,
+        reasons: vec![event.error_summary.clone().unwrap_or_default()],
+        recommended_doc: "docs/operations.md".to_string(),
+        related_files: event.related_files.clone(),
+        evidence: vec![CandidateEvidence {
+            kind: "execution_event".to_string(),
+            reference: event.id.clone(),
+            summary: event.error_summary.clone().unwrap_or_default(),
+        }],
+        idempotency_key: event.idempotency_key.clone(),
+        suggested_operation: Some("update".to_string()),
+        confidence: 55,
+        reviewed_by_model: false,
+        model_recommendation: None,
+        model_rationale: None,
+        status: KnowledgeStatus::Pending,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    candidates.push(candidate.clone());
+    write_inbox_candidates(&inbox_path(&project_root), &candidates)?;
+    record_event(
+        &project_root,
+        AgentEventType::KnowledgeCandidateCreated,
+        "cyclaw-core",
+        "从执行失败生成待审候选",
+        serde_json::json!({"candidate_id":candidate.id,"execution_event_id":event.id}),
+    )?;
+    Ok(ExecutionEventRecordResult {
+        duplicate: false,
+        candidate: Some(candidate),
+    })
+}
+
+/// 从独立事件源采集测试或构建报告。该入口由 Observer 调用，MCP 上报只是兼容方式。
+pub fn observe_execution_artifacts(project_root: &Path, paths: &[PathBuf]) -> Result<usize> {
+    ensure_directory(project_root)?;
+    let mut recorded = 0;
+    for path in paths {
+        if !is_execution_artifact(path) || !path.is_file() {
+            continue;
+        }
+        let content = fs::read_to_string(path).unwrap_or_default();
+        let Some(error_summary) = execution_failure_summary(&content) else {
+            continue;
+        };
+        let relative = relative_or_display(project_root, path);
+        let event = cyclaw_events::new_execution_event(
+            "observer-artifact",
+            cyclaw_events::ExecutionEventKind::Test,
+            format!("测试报告 {}", relative),
+            Some(1),
+            false,
+            vec![relative.clone()],
+            Some(error_summary),
+        );
+        let result = record_execution_event(project_root.to_path_buf(), event)?;
+        if !result.duplicate {
+            recorded += 1;
+        }
+        record_event(
+            project_root,
+            AgentEventType::ObserverArtifactObserved,
+            "cyclaw-observer",
+            "观察到测试或构建报告",
+            serde_json::json!({"path": relative}),
+        )?;
+    }
+    Ok(recorded)
+}
+
 pub fn update_inbox_status(
     project_root: PathBuf,
     candidate_id: &str,
@@ -509,6 +645,14 @@ pub fn update_inbox_status(
         anyhow::bail!("未找到候选知识: {}", candidate_id);
     };
 
+    if !candidate.status.can_transition_to(&status) {
+        anyhow::bail!(
+            "不允许将候选 {} 从 {:?} 迁移到 {:?}",
+            candidate_id,
+            candidate.status,
+            status
+        );
+    }
     candidate.status = status;
     candidate.updated_at = Utc::now().to_rfc3339();
     let updated = candidate.clone();
@@ -546,6 +690,17 @@ pub fn update_candidate_review(
     candidate.reviewed_by_model = true;
     candidate.model_recommendation = Some(recommendation);
     candidate.model_rationale = Some(rationale);
+    if candidate.model_recommendation.as_deref() == Some("keep")
+        && candidate.status == KnowledgeStatus::Pending
+    {
+        candidate.status = KnowledgeStatus::Verified;
+    } else if candidate.model_recommendation.as_deref() == Some("ignore")
+        && candidate
+            .status
+            .can_transition_to(&KnowledgeStatus::Ignored)
+    {
+        candidate.status = KnowledgeStatus::Ignored;
+    }
     candidate.updated_at = Utc::now().to_rfc3339();
     let updated = candidate.clone();
     write_inbox_candidates(&inbox_path, &candidates)?;
@@ -594,7 +749,11 @@ pub fn generate_document_drafts(options: DraftOptions) -> Result<DraftResult> {
         })
         .filter(|candidate| {
             candidate.status == KnowledgeStatus::Accepted
-                || (options.include_pending && candidate.status == KnowledgeStatus::Pending)
+                || (options.include_pending
+                    && matches!(
+                        candidate.status,
+                        KnowledgeStatus::Pending | KnowledgeStatus::Verified
+                    ))
         })
         .filter(|candidate| !existing_candidate_ids.contains(&candidate.id))
         .filter(|candidate| {
@@ -988,6 +1147,14 @@ pub fn get_latest_reconciliation(project_root: &Path) -> Result<Option<Reconcili
     memory_latest_reconciliation(project_root)
 }
 
+pub fn set_task_phase(
+    project_root: &Path,
+    task_id: Option<&str>,
+    phase: TaskPhase,
+) -> Result<TaskRecord> {
+    memory_set_task_phase(project_root, task_id, phase)
+}
+
 pub fn get_task_context(
     project_root: &Path,
     task_id: Option<&str>,
@@ -1034,7 +1201,12 @@ pub fn get_task_context(
     let mut candidates = list_inbox(project_root.to_path_buf())?
         .candidates
         .into_iter()
-        .filter(|candidate| candidate.status == KnowledgeStatus::Pending)
+        .filter(|candidate| {
+            matches!(
+                candidate.status,
+                KnowledgeStatus::Pending | KnowledgeStatus::Verified
+            )
+        })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|item| std::cmp::Reverse(item.confidence));
     let related = task.related_files.iter().collect::<HashSet<_>>();
@@ -1043,7 +1215,13 @@ pub fn get_task_context(
             .related_files
             .iter()
             .any(|path| related.contains(path));
-        (!directly_related, std::cmp::Reverse(candidate.confidence))
+        let failure_priority = matches!(task.phase, TaskPhase::Investigate | TaskPhase::Verify)
+            && candidate.source_type == KnowledgeSourceType::ExecutionFailure;
+        (
+            !failure_priority,
+            !directly_related,
+            std::cmp::Reverse(candidate.confidence),
+        )
     });
     candidates.truncate(limit.clamp(1, 20));
     candidates.retain(|candidate| {
@@ -1062,6 +1240,17 @@ pub fn get_task_context(
         }
     });
 
+    let selection_reason = format!(
+        "任务阶段 {:?}：{}",
+        task.phase,
+        match task.phase {
+            TaskPhase::Investigate => "优先失败事件与证据",
+            TaskPhase::Design => "优先约束、架构与相关事实",
+            TaskPhase::Implement => "优先相关文件和待处理候选",
+            TaskPhase::Verify => "优先失败事件、检查点与验证线索",
+            TaskPhase::Handoff => "优先阶段摘要和已验证事实",
+        }
+    );
     Ok(TaskContextPack {
         related_files: task.related_files.clone(),
         task,
@@ -1072,6 +1261,7 @@ pub fn get_task_context(
         estimated_tokens,
         budget_tokens: budget,
         truncated,
+        selection_reason,
     })
 }
 
@@ -1175,38 +1365,108 @@ pub fn watch_project_once(
         project_root.to_path_buf(),
         Some(diff_result.analysis_path.clone()),
     ))?;
-    let policy = load_or_default(project_root)?;
-    let mut auto_applied_patches = 0;
-    let has_non_documentation_changes = diff_result.analysis.changed_files.iter().any(|file| {
-        let normalized = file.path.replace('\\', "/").to_lowercase();
-        !normalized.starts_with("docs/")
-            && normalized != "readme.md"
-            && !normalized.starts_with(".cyclaw/")
-    });
-    if has_non_documentation_changes
-        && policy.permissions.allow_docs_apply
-        && policy.permissions.allow_auto_apply_docs
-    {
-        let draft_result = generate_document_drafts(
-            DraftOptions::new(project_root.to_path_buf(), None, true).with_confidence(
-                policy.automation.auto_apply_min_confidence,
-                policy.permissions.allow_model_call && policy.permissions.allow_network,
-            ),
-        );
-        if let Ok(draft_result) = draft_result {
-            for patch in draft_result.patches {
-                if apply_document_patch(project_root.to_path_buf(), &patch.id).is_ok() {
-                    auto_applied_patches += 1;
-                }
-            }
-        }
-    }
     Ok(WatchTick {
         changed: true,
         diff_result: Some(diff_result),
         inbox_result: Some(inbox_result),
-        auto_applied_patches,
+        // 文档写入必须基于可验证事实或明确审批，路径规则候选不能自动落盘。
+        auto_applied_patches: 0,
     })
+}
+
+/// 执行一次可恢复的项目观察。首次运行会初始化、扫描并处理已有改动，后续使用持久化快照增量处理。
+pub fn observe_project_once(project_root: &Path) -> Result<ObserverTick> {
+    ensure_directory(project_root)?;
+    let state_path = observer_state_path(project_root);
+    let mut initialized = false;
+    let mut scanned = false;
+    if !project_root.join(CYCLE_DIR).join("config.yaml").exists() {
+        init_project(InitOptions::new(project_root.to_path_buf()))?;
+        initialized = true;
+    }
+    if !project_root
+        .join(CYCLE_DIR)
+        .join("project-profile.json")
+        .exists()
+    {
+        scan_project(ScanOptions::new(project_root.to_path_buf()))?;
+        scanned = true;
+    }
+
+    let mut state = read_observer_state(project_root)?.unwrap_or_else(|| ObserverState {
+        schema_version: 1,
+        started_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        last_snapshot: None,
+        last_reconciled_at: None,
+    });
+    let watch = watch_project_once(project_root, state.last_snapshot.as_ref())?;
+    let indexed = if watch.changed || !index_path(project_root).exists() {
+        index_project(project_root.to_path_buf())?;
+        true
+    } else {
+        false
+    };
+    let mut verified_facts = 0;
+    let reconciliation = if watch.changed {
+        for fact in list_project_facts(project_root)? {
+            if verify_fact_evidence(project_root, &fact.id).is_ok() {
+                verified_facts += 1;
+            }
+        }
+        let report = reconcile_project_knowledge(project_root, None)?;
+        state.last_reconciled_at = Some(Utc::now().to_rfc3339());
+        Some(report)
+    } else {
+        None
+    };
+    state.last_snapshot = Some(current_change_snapshot(project_root)?);
+    state.updated_at = Utc::now().to_rfc3339();
+    write_observer_state(&state_path, &state)?;
+    record_event(
+        project_root,
+        if initialized {
+            AgentEventType::ObserverStarted
+        } else {
+            AgentEventType::ObserverReconciled
+        },
+        "cyclaw-observer",
+        if initialized {
+            "独立观察器已初始化项目"
+        } else {
+            "独立观察器完成项目对账"
+        },
+        serde_json::json!({"changed":watch.changed,"indexed":indexed,"verified_facts":verified_facts}),
+    )?;
+    Ok(ObserverTick {
+        initialized,
+        scanned,
+        indexed,
+        watch,
+        verified_facts,
+        reconciliation,
+        state_path,
+    })
+}
+
+/// 在没有新文件事件时执行低频维护，防止事实证据和知识关系长期漂移。
+pub fn maintain_project_knowledge(project_root: &Path) -> Result<(usize, ReconciliationReport)> {
+    ensure_directory(project_root)?;
+    let mut verified_facts = 0;
+    for fact in list_project_facts(project_root)? {
+        if verify_fact_evidence(project_root, &fact.id).is_ok() {
+            verified_facts += 1;
+        }
+    }
+    let report = reconcile_project_knowledge(project_root, None)?;
+    record_event(
+        project_root,
+        AgentEventType::ObserverReconciled,
+        "cyclaw-observer",
+        "独立观察器完成周期知识维护",
+        serde_json::json!({"verified_facts":verified_facts}),
+    )?;
+    Ok((verified_facts, report))
 }
 
 fn ensure_cyclaw_dir(project_root: &Path) -> Result<PathBuf> {
@@ -1218,6 +1478,45 @@ fn ensure_cyclaw_dir(project_root: &Path) -> Result<PathBuf> {
 
 fn inbox_path(project_root: &Path) -> PathBuf {
     project_root.join(CYCLE_DIR).join("knowledge-inbox.jsonl")
+}
+
+pub fn observer_state_path(project_root: &Path) -> PathBuf {
+    project_root.join(CYCLE_DIR).join("observer-state.json")
+}
+
+fn read_observer_state(project_root: &Path) -> Result<Option<ObserverState>> {
+    let path = observer_state_path(project_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+}
+
+fn write_observer_state(path: &Path, state: &ObserverState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+fn is_execution_artifact(path: &Path) -> bool {
+    let value = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    value.contains("surefire-reports")
+        || value.contains("test-results")
+        || value.contains("junit")
+        || value.contains("reports/tests")
+}
+
+fn execution_failure_summary(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let failed = lower.contains("<failure")
+        || lower.contains("<error")
+        || lower.contains("failures=\"") && !lower.contains("failures=\"0\"")
+        || lower.contains("errors=\"") && !lower.contains("errors=\"0\"")
+        || lower.contains(" failed")
+        || lower.contains("error:");
+    failed.then(|| "测试或构建报告包含失败信号，请检查报告原文".to_string())
 }
 
 fn inbox_path_exists(cyclaw_dir: &Path) -> bool {
@@ -1384,34 +1683,6 @@ fn record_event(
     append_event(project_root, &new_event(event_type, source, summary, data)).map(|_| ())
 }
 
-fn default_config(project_root: &Path) -> CyclawConfig {
-    CyclawConfig {
-        schema_version: 1,
-        project_root: project_root.display().to_string(),
-        created_at: Utc::now().to_rfc3339(),
-        scan: ScanConfig {
-            ignored_dirs: vec![
-                ".git".to_string(),
-                ".cyclaw".to_string(),
-                "node_modules".to_string(),
-                "target".to_string(),
-                "dist".to_string(),
-                "build".to_string(),
-                ".next".to_string(),
-                ".venv".to_string(),
-                "__pycache__".to_string(),
-            ],
-            docs_dir: "docs".to_string(),
-        },
-        permissions: PermissionConfig {
-            read_scope: "project".to_string(),
-            write_scopes: vec!["docs".to_string(), ".cyclaw".to_string()],
-            allow_network: false,
-            allow_shell: false,
-        },
-    }
-}
-
 fn write_project_profile(project_root: &Path, profile: &ProjectProfile) -> Result<PathBuf> {
     let path = project_root.join(CYCLE_DIR).join("project-profile.json");
     let json = serde_json::to_string_pretty(profile)?;
@@ -1535,11 +1806,10 @@ mod tests {
     use std::process::Command;
 
     #[test]
-    fn default_config_is_local_first() {
-        let config = default_config(Path::new("/tmp/project"));
+    fn default_policy_is_local_first() {
+        let config = cyclaw_policy::default_policy();
 
         assert!(!config.permissions.allow_network);
-        assert!(!config.permissions.allow_shell);
         assert!(
             config
                 .permissions
@@ -1644,6 +1914,53 @@ mod tests {
         let list_result = list_inbox(temp.path().to_path_buf()).unwrap();
         assert_eq!(list_result.candidates.len(), 1);
         assert_eq!(list_result.candidates[0].status, KnowledgeStatus::Accepted);
+    }
+
+    #[test]
+    fn observer_bootstrap_processes_existing_changes_without_agent_call() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        run_git(temp.path(), &["config", "user.name", "Test User"]);
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"react":"latest"}}"#,
+        )
+        .unwrap();
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"react":"latest","vite":"latest"}}"#,
+        )
+        .unwrap();
+
+        let first = observe_project_once(temp.path()).unwrap();
+        assert!(first.initialized);
+        assert!(first.watch.changed);
+        assert!(first.state_path.exists());
+        assert!(!first.watch.inbox_result.unwrap().added.is_empty());
+
+        let second = observe_project_once(temp.path()).unwrap();
+        assert!(!second.watch.changed);
+    }
+
+    #[test]
+    fn execution_failure_creates_deduplicated_pending_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let event = cyclaw_events::new_execution_event(
+            "test",
+            cyclaw_events::ExecutionEventKind::Test,
+            "cargo test",
+            Some(1),
+            false,
+            vec!["src/lib.rs".to_string()],
+            Some("断言失败".to_string()),
+        );
+        let first = record_execution_event(temp.path().to_path_buf(), event.clone()).unwrap();
+        assert_eq!(first.candidate.unwrap().status, KnowledgeStatus::Pending);
+        let second = record_execution_event(temp.path().to_path_buf(), event).unwrap();
+        assert!(second.duplicate);
     }
 
     #[test]

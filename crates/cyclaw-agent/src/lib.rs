@@ -4,14 +4,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use cyclaw_core::{
-    DraftOptions, apply_document_patch, generate_document_drafts, list_document_patches,
-    list_inbox, project_status, update_candidate_review, watch_project_once,
+    list_document_patches, list_inbox, project_status, update_candidate_review, watch_project_once,
 };
 use cyclaw_docs::DocumentPatchStatus;
-use cyclaw_events::{AgentEventType, append_event, new_event};
+use cyclaw_events::{AgentEventType, append_event, new_event, new_id};
 use cyclaw_knowledge::KnowledgeStatus;
 use cyclaw_model::{TestProviderOptions, list_providers, test_provider};
-use cyclaw_policy::load_or_default;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +56,8 @@ pub struct AgentRunRecord {
     pub pending_knowledge_count: usize,
     pub pending_patch_count: usize,
     pub model_provider: Option<String>,
-    pub model_response: Option<String>,
+    /// 仅保存脱敏摘要，避免把外部模型输出作为长期项目数据留存。
+    pub model_response_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,7 +125,7 @@ pub fn cleanup_agent_runs(project_root: &Path, keep: usize) -> Result<usize> {
 pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
     ensure_directory(&options.project_root)?;
     let started_at = Utc::now();
-    let run_id = format!("agent-{}", started_at.format("%Y%m%d%H%M%S"));
+    let run_id = new_id("agent");
     let mut steps = Vec::new();
 
     let status = project_status(options.project_root.clone())?;
@@ -204,7 +203,7 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
     });
 
     let mut model_provider = None;
-    let mut model_response = None;
+    let mut model_response_summary = None;
     if options.use_model {
         match resolve_provider(&options.project_root, options.provider.clone()) {
             Ok(Some(provider_name)) => {
@@ -248,7 +247,7 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
                     Err(error) => review_error = Some(error.to_string()),
                 }
                 model_provider = Some(provider_name.clone());
-                model_response = Some(result.response);
+                model_response_summary = Some(summarize_model_response(&result.response));
                 steps.push(AgentStep {
                     name: "model_review".to_string(),
                     status: if review_error.is_none() {
@@ -284,36 +283,11 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
         });
     }
 
-    let policy = load_or_default(&options.project_root)?;
-    if options.use_model
-        && policy.permissions.allow_docs_apply
-        && policy.permissions.allow_auto_apply_docs
-    {
-        let generated = generate_document_drafts(
-            DraftOptions::new(options.project_root.clone(), None, true)
-                .with_confidence(policy.automation.auto_apply_min_confidence, true),
-        );
-        let mut applied = 0;
-        if let Ok(result) = generated {
-            for patch in result.patches {
-                if apply_document_patch(options.project_root.clone(), &patch.id).is_ok() {
-                    applied += 1;
-                }
-            }
-        }
-        steps.push(AgentStep {
-            name: "apply_model_reviewed_documents".to_string(),
-            status: if applied > 0 {
-                AgentStepStatus::Completed
-            } else {
-                AgentStepStatus::Skipped
-            },
-            detail: format!(
-                "threshold={}, applied={}",
-                policy.automation.auto_apply_min_confidence, applied
-            ),
-        });
-    }
+    steps.push(AgentStep {
+        name: "apply_model_reviewed_documents".to_string(),
+        status: AgentStepStatus::Skipped,
+        detail: "兼容批处理不会自动写入文档；请通过受控 Patch 审批".to_string(),
+    });
 
     let completed_at = Utc::now();
     let record = AgentRunRecord {
@@ -327,7 +301,7 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
         pending_knowledge_count: pending_candidates.len(),
         pending_patch_count: pending_patches.len(),
         model_provider,
-        model_response,
+        model_response_summary,
     };
     let record_path = write_record(&options.project_root, &record)?;
     append_event(
@@ -423,6 +397,12 @@ fn parse_model_reviews(response: &str) -> Result<ModelReviewResponse> {
         trimmed
     };
     serde_json::from_str(json).context("模型未返回合法的候选审查 JSON")
+}
+
+fn summarize_model_response(response: &str) -> String {
+    let normalized = response.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview = normalized.chars().take(240).collect::<String>();
+    format!("chars={} preview={}", response.chars().count(), preview)
 }
 
 fn write_record(project_root: &Path, record: &AgentRunRecord) -> Result<PathBuf> {

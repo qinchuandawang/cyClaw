@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -8,6 +9,22 @@ use serde::{Deserialize, Serialize};
 
 const CYCLE_DIR: &str = ".cyclaw";
 const EVENTS_FILE: &str = "events.jsonl";
+const EXECUTION_EVENTS_FILE: &str = "execution-events.jsonl";
+static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 进程内严格递增，并携带时间与进程信息，避免并发运行覆盖持久化记录。
+pub fn new_id(prefix: &str) -> String {
+    let now = Utc::now();
+    let nanos = now.timestamp_nanos_opt().unwrap_or_default();
+    let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{:x}-{:x}-{:x}",
+        prefix,
+        nanos,
+        std::process::id(),
+        sequence
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentEvent {
@@ -45,6 +62,106 @@ pub enum AgentEventType {
     FactPatchRecoveryCompleted,
     FactPatchRecoveryBlocked,
     KnowledgeReconciled,
+    ObserverStarted,
+    ObserverReconciled,
+    ObserverArtifactObserved,
+    ExecutionObserved,
+    ExecutionFailed,
+    ExecutionSucceeded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionEvent {
+    pub schema_version: u32,
+    pub id: String,
+    pub idempotency_key: String,
+    pub created_at: String,
+    pub source: String,
+    pub kind: ExecutionEventKind,
+    pub command_summary: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub related_files: Vec<String>,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEventKind {
+    Command,
+    Build,
+    Test,
+    Patch,
+}
+
+pub fn execution_events_path(project_root: &Path) -> PathBuf {
+    project_root.join(CYCLE_DIR).join(EXECUTION_EVENTS_FILE)
+}
+
+pub fn append_execution_event(project_root: &Path, event: &ExecutionEvent) -> Result<PathBuf> {
+    let path = execution_events_path(project_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建执行事件目录: {}", parent.display()))?;
+    }
+    let line = serde_json::to_string(event)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    writeln!(file, "{}", line)?;
+    Ok(path)
+}
+
+pub fn read_execution_events(project_root: &Path) -> Result<Vec<ExecutionEvent>> {
+    let path = execution_events_path(project_root);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(path)?;
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Ok(serde_json::from_str(line)?))
+        .collect()
+}
+
+pub fn new_execution_event(
+    source: impl Into<String>,
+    kind: ExecutionEventKind,
+    command_summary: impl Into<String>,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    related_files: Vec<String>,
+    error_summary: Option<String>,
+) -> ExecutionEvent {
+    let command_summary = command_summary.into();
+    let id = new_id("execution");
+    ExecutionEvent {
+        schema_version: 1,
+        idempotency_key: format!(
+            "{}:{}:{}:{}",
+            kind_name(&kind),
+            command_summary,
+            exit_code.unwrap_or_default(),
+            timed_out
+        ),
+        id,
+        created_at: Utc::now().to_rfc3339(),
+        source: source.into(),
+        kind,
+        command_summary,
+        exit_code,
+        timed_out,
+        related_files,
+        error_summary,
+    }
+}
+
+fn kind_name(kind: &ExecutionEventKind) -> &'static str {
+    match kind {
+        ExecutionEventKind::Command => "command",
+        ExecutionEventKind::Build => "build",
+        ExecutionEventKind::Test => "test",
+        ExecutionEventKind::Patch => "patch",
+    }
 }
 
 pub fn events_path(project_root: &Path) -> PathBuf {
@@ -92,7 +209,7 @@ pub fn new_event(
     let now = Utc::now();
     AgentEvent {
         schema_version: 1,
-        id: format!("event-{}", now.format("%Y%m%d%H%M%S%3f")),
+        id: new_id("event"),
         event_type,
         created_at: now.to_rfc3339(),
         source: source.into(),
@@ -122,5 +239,32 @@ mod tests {
         assert!(path.exists());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].summary, "agent completed");
+    }
+
+    #[test]
+    fn execution_events_are_unique_and_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = new_execution_event(
+            "test",
+            ExecutionEventKind::Test,
+            "cargo test",
+            Some(1),
+            false,
+            vec!["src/lib.rs".to_string()],
+            Some("断言失败".to_string()),
+        );
+        let second = new_execution_event(
+            "test",
+            ExecutionEventKind::Test,
+            "cargo test",
+            Some(1),
+            false,
+            Vec::new(),
+            Some("断言失败".to_string()),
+        );
+        assert_ne!(first.id, second.id);
+        append_execution_event(temp.path(), &first).unwrap();
+        let events = read_execution_events(temp.path()).unwrap();
+        assert_eq!(events[0].command_summary, "cargo test");
     }
 }

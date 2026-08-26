@@ -153,7 +153,12 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
         anyhow::bail!("未找到模型 Provider: {}", options.name);
     };
 
-    let cache_key = cache_key(&options.name, provider, &options.prompt);
+    let prompt = if policy.model_policy.redact_secrets {
+        redact_sensitive_text(&options.prompt)
+    } else {
+        options.prompt.clone()
+    };
+    let cache_key = cache_key(&options.name, provider, &prompt);
     if let Some(response) = read_cached_response(&options.project_root, &cache_key)? {
         return Ok(TestProviderResult {
             provider_name: options.name,
@@ -171,7 +176,7 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
     let response = test_openai_compatible(
         provider,
         &api_key,
-        &options.prompt,
+        &prompt,
         Duration::from_secs(policy.model_policy.request_timeout_seconds.max(1)),
         policy.model_policy.max_retries,
     )?;
@@ -311,6 +316,29 @@ fn default_config() -> ModelProvidersConfig {
         active_provider: None,
         providers: BTreeMap::new(),
     }
+}
+
+/// 仅在发送外部 Provider 前做保守脱敏；原始项目证据不被写回或覆盖。
+fn redact_sensitive_text(input: &str) -> String {
+    input
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            let contains_secret_name = ["api_key", "apikey", "password", "secret", "token"]
+                .iter()
+                .any(|name| lower.contains(name));
+            if contains_secret_name {
+                if let Some(index) = line.find('=') {
+                    return format!("{}=<已脱敏>", &line[..index]);
+                }
+                if let Some(index) = line.find(':') {
+                    return format!("{}: <已脱敏>", &line[..index]);
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn test_openai_compatible(

@@ -59,7 +59,7 @@ cyclaw task close "任务完成" --path <project-path>
 - `.cyclaw/` 包含项目画像、任务、结构化事实、索引、候选、文档草稿和审计事件；默认不应提交到 Git。
 - CLI 只在配置中保存 API Key 环境变量名；VS Code API Key 保存在本机 SecretStorage。
 - 使用外部模型前，确认发送的上下文符合组织数据政策。
-- 自动文档写入默认关闭，所有写入保留 Patch、事件和撤销能力。
+- cyClaw 不会依据路径规则候选自动写入文档；所有写入保留 Patch、事件和撤销能力。
 
 完整安全边界和漏洞报告方式见 [SECURITY.md](SECURITY.md)，本地数据与模型 Provider 行为见 [PRIVACY.md](PRIVACY.md)，发布流程见 [发布指南](docs/release-guide.md)。
 
@@ -71,7 +71,7 @@ cargo run -p cyclaw-cli -- init
 cargo run -p cyclaw-cli -- scan
 cargo run -p cyclaw-cli -- status
 cargo run -p cyclaw-cli -- diff
-cargo run -p cyclaw-cli -- watch
+cargo run -p cyclaw-cli -- observer run
 cargo run -p cyclaw-cli -- inbox generate
 cargo run -p cyclaw-cli -- inbox list
 cargo run -p cyclaw-cli -- draft generate --include-pending
@@ -80,7 +80,7 @@ cargo run -p cyclaw-cli -- index
 cargo run -p cyclaw-cli -- search "项目"
 cargo run -p cyclaw-cli -- mcp
 cargo run -p cyclaw-cli -- model list
-cargo run -p cyclaw-cli -- agent run --once --no-model
+cargo run -p cyclaw-cli -- observer run --once
 cargo run -p cyclaw-cli -- policy show
 cargo run -p cyclaw-cli -- events list
 cargo run -p cyclaw-cli -- hooks run session-stop
@@ -94,7 +94,7 @@ cargo run -p cyclaw-cli -- hooks install-git
 ```bash
 cargo run -p cyclaw-cli -- init
 cargo run -p cyclaw-cli -- scan
-cargo run -p cyclaw-cli -- watch --once
+cargo run -p cyclaw-cli -- observer run --once
 cargo run -p cyclaw-cli -- inbox list --pending
 cargo run -p cyclaw-cli -- draft generate --include-pending
 cargo run -p cyclaw-cli -- draft list
@@ -186,46 +186,40 @@ cyclaw model add deepseek `
   --thinking
 ```
 
-VS Code 的 `cyClaw: 管理高级权限` 展示并控制项目实际能力：本地知识维护、文档写入、模型 API 与联网、自动管理文档、Shell 自动化和源码写入。权限提升时需要确认，并持久化到当前项目 `.cyclaw/config.yaml`。其中“自动管理文档”是独立的高风险权限，开启后 cyClaw Watch 会在发现代码变更时自动生成并写入 `docs/` 文档，不再等待人工确认；它必须与“文档写入”同时开启，默认关闭。
+VS Code 的 `cyClaw: 管理高级权限` 只控制真实能力：本地知识维护、文档 Patch 应用、模型 API 与联网。权限提升会写入当前项目 `.cyclaw/config.yaml`。cyClaw 不提供 Shell 自动化、源码写入或基于候选的自动文档写入。
 
-插件的“运行概览”会直接显示当前项目是否发现变更、待处理知识、待应用草稿和自动文档状态。默认模式下，Watch 只收集知识并生成草稿；开启自动管理文档后，概览和 CLI 输出会显示本次自动应用的文档数量，实际修改仍可从 Git diff 和事件日志追溯。
+插件的“运行概览”会显示 Observer 状态、待处理知识和待应用草稿。文档草稿始终需要通过可审计 Patch 明确审批，实际修改可从 Git diff 和事件日志追溯。
 
 Watch 使用文件内容快照计算相对上一次事件的增量变化；同一个已修改文件继续编辑时仍会触发，但本次分析只包含真正发生变化的文件。CLI 会分别输出分析候选、实际新增、已存在和待处理总数。
 
-常驻 Watch 已升级为操作系统文件事件驱动，不再每 3 秒轮询。文件事件经过短时间合并后，再由 Git 内容快照确认真实变化；空闲时不会输出“未发现新的项目变更”。VS Code 插件默认不自动弹出日志面板，日志可从“查看运行日志”按需打开。
+常驻 Observer 使用操作系统文件事件驱动，不再每 3 秒轮询。文件事件经过短时间合并后，再由 Git 内容快照确认真实变化；空闲期间会周期验证 Fact 证据并执行知识对账。VS Code 插件默认不自动弹出日志面板，日志可从“查看运行日志”按需打开。
 
 为对齐 Claude Code 和 Codex 的安全边界，插件只在受信任工作区执行本地 CLI；内容快照不跟随符号链接，超过 8MB 的文件使用轻量签名，事件通道有固定容量，避免大型项目和事件风暴造成不必要的资源占用。
 
-VS Code 插件提供观察、审阅、智能审阅和自动文档四种运行策略，并展示最近活动。运行策略是一组常用权限预设；高级权限用于逐项自定义，组合不属于预设时界面显示“自定义权限”。候选可以打开证据详情并一键生成草稿，草稿可以直接查看 Diff，应用后可以撤销。已配置活动模型且授予模型与联网权限时，“运行 Agent”会默认执行模型审查。
+VS Code 插件提供观察、审阅和智能审阅三种策略，并展示最近活动。Observer 独立处理事件，候选可打开证据详情并生成草稿；草稿可以查看 Diff、应用和撤销。模型审阅是可选的辅助确认，不是事件采集前提。
 
-候选包含 `confidence`、`reviewed_by_model`、`model_recommendation` 和 `model_rationale`。本地规则初始置信度为高 `90`、中 `75`、低 `55`；模型以结构化 JSON 重新审查并写回结论。自动文档默认阈值为 `90`，且在启用模型能力时只自动应用模型推荐 `keep`、达到阈值并由本轮新生成的草稿。
-
-设置自动写入阈值：
-
-```powershell
-cyclaw policy set-auto-threshold 90
-```
+候选包含 `confidence`、`reviewed_by_model`、`model_recommendation` 和 `model_rationale`。路径分类仅作召回，初始置信度为高 `70`、中 `55`、低 `40`；模型或额外证据可以提高可信度，但不会直接写入项目文档。
 
 CLI 开启方式：
 
-```powershell
-cyclaw policy enable-auto-docs
-```
-
-关闭自动管理文档：
+独立 Observer：
 
 ```powershell
-cyclaw policy set allow_auto_apply_docs --enabled=false
+cyclaw observer run --path .
+cyclaw observer run --once --path .
+cyclaw observer status --path .
+cyclaw observer install --path .
 ```
 
-Agent Runtime：
+Observer 启动时会补偿扫描已有变化，随后独立监听文件/Git/测试报告，并周期验证 Fact 证据和执行知识对账。它不依赖 Codex MCP 调用、任务协议或 IDE 是否打开。
+
+Windows 可使用 `cyclaw observer install --path .` 注册当前用户登录时自动启动的任务，并立即启动 Observer；`cyclaw observer uninstall --path .` 可删除该任务。
+
+Observer 黑盒验证会创建隔离 Git 项目，模拟源码修改、Surefire 失败报告和进程重启：
 
 ```powershell
-cyclaw agent run --once --no-model
-cyclaw agent run --once --provider deepseek
+.\scripts\test-observer-e2e.ps1
 ```
-
-`--no-model` 只运行本地状态收集、变更分析和候选/草稿统计。指定模型 Provider 后，Agent 会调用用户配置的大模型生成一次项目知识处理建议，并把运行记录写入 `.cyclaw/agent-runs/`。
 
 Agent 运行记录管理：
 
@@ -247,11 +241,11 @@ cargo run -p cyclaw-cli -- agent runs clean --keep 20
 - `get_candidate_detail`、`review_candidate`：查看证据并审阅候选。
 - `preview_document_patch`：生成或复用草稿，不修改目标文档。
 - `apply_document_patch`、`revert_document_patch`：应用或撤销通过权限检查的文档变更。
-- `run_agent`、`set_runtime_strategy`：运行 Agent 和切换当前项目策略。
+- `run_agent`、`set_runtime_strategy`：兼容性的批处理审阅与策略设置，不承担事件采集职责。
 - `doctor`：检查 Git、初始化、权限、候选、活动模型和文档写入状态。
-- `begin_task`、`get_active_task`、`get_task_context`：建立任务边界，并按 Token 预算编译当前任务所需上下文。
-- `record_decision`、`record_failed_approach`、`checkpoint_task`：在工作过程中沉淀决策、失败路径和检查点。
-- `reconcile_project_knowledge`、`close_task`：发现重复、冲突和失效事实，并完成任务收尾。
+- `begin_task`、`get_active_task`、`get_task_context`：历史兼容的任务上下文读取接口。
+- `record_decision`、`record_failed_approach`、`checkpoint_task`：人工补录入口，不要求 Coding Agent 调用。
+- `reconcile_project_knowledge`、`close_task`：手动诊断入口；Observer 会自动执行相同的对账能力。
 - `list_project_facts`、`list_tasks`、`get_latest_reconciliation`：读取跨会话项目事实、任务历史和最近对账报告。
 
 MCP 不提供任意 Shell、任意文件写入或删除能力。所有写操作复用 Rust Core 的权限、路径、置信度和事件审计约束。

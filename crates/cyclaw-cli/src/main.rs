@@ -1,4 +1,5 @@
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -16,7 +17,8 @@ use cyclaw_core::{
     close_task, current_change_snapshot, diagnose_fact_patch_transactions,
     generate_document_drafts, generate_inbox, get_active_task, get_latest_reconciliation,
     get_task_context, index_project, init_project, list_document_patches, list_inbox,
-    list_project_facts, list_tasks, preview_fact_patch, project_fact_from_input, project_status,
+    list_project_facts, list_tasks, maintain_project_knowledge, observe_execution_artifacts,
+    observe_project_once, preview_fact_patch, project_fact_from_input, project_status,
     query_evidence_verifications, query_fact_patches, reconcile_project_knowledge,
     record_task_decision, record_task_failed_approach, revert_document_patch, revert_fact_patch,
     scan_project, search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
@@ -27,10 +29,7 @@ use cyclaw_model::{
     AddProviderOptions, TestProviderOptions, add_provider, list_providers, test_provider,
     use_provider,
 };
-use cyclaw_policy::{
-    PermissionLevel, check_write_path, load_or_default, set_auto_apply_min_confidence,
-    set_permission,
-};
+use cyclaw_policy::{PermissionLevel, check_write_path, load_or_default, set_permission};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Parser)]
@@ -82,6 +81,11 @@ enum Commands {
         /// 只检查一次，用于调试和测试
         #[arg(long, default_value_t = false)]
         once: bool,
+    },
+    /// 运行独立项目观察器；不依赖 Coding Agent、MCP 调用或 IDE 生命周期
+    Observer {
+        #[command(subcommand)]
+        command: ObserverCommand,
     },
     /// 管理知识收件箱
     Inbox {
@@ -531,6 +535,43 @@ enum AgentCommand {
 }
 
 #[derive(Subcommand)]
+enum ObserverCommand {
+    /// 前台运行常驻观察器；首次启动会自动补偿扫描已有变更
+    Run {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// 文件事件合并窗口，单位毫秒
+        #[arg(long, default_value_t = 600)]
+        debounce_ms: u64,
+        /// 周期执行事实证据验证和知识对账的间隔，单位秒
+        #[arg(long, default_value_t = 300)]
+        maintenance_interval_seconds: u64,
+        /// 只执行启动补偿，不进入常驻循环
+        #[arg(long, default_value_t = false)]
+        once: bool,
+    },
+    /// 输出 Observer 持久化状态
+    Status {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 安装当前用户的开机登录观察任务（Windows）并立即启动
+    Install {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// 卸载当前项目对应的观察任务（Windows）
+    Uninstall {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AgentRunsCommand {
     /// 查看最近 Agent 运行记录
     List {
@@ -675,7 +716,7 @@ enum PolicyCommand {
     },
     /// 设置权限开关
     Set {
-        /// 权限键：allow_model_call/allow_network/allow_shell/allow_code_write/allow_docs_apply
+        /// 权限键：allow_model_call/allow_network/allow_docs_apply
         key: String,
         /// 是否启用
         #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
@@ -692,20 +733,6 @@ enum PolicyCommand {
     },
     /// 启用文档草稿应用权限
     EnableDocsApply {
-        /// 项目根目录，默认使用当前目录
-        #[arg(short, long)]
-        path: Option<PathBuf>,
-    },
-    /// 启用自动生成并应用文档的高风险权限
-    EnableAutoDocs {
-        /// 项目根目录，默认使用当前目录
-        #[arg(short, long)]
-        path: Option<PathBuf>,
-    },
-    /// 设置自动写入文档所需的最低置信度
-    SetAutoThreshold {
-        /// 置信度阈值，范围 0-100
-        confidence: u8,
         /// 项目根目录，默认使用当前目录
         #[arg(short, long)]
         path: Option<PathBuf>,
@@ -832,6 +859,87 @@ fn main() -> Result<()> {
                 println!("- {}：{}", asset.asset, asset.reason);
             }
         }
+        Commands::Observer { command } => match command {
+            ObserverCommand::Run {
+                path,
+                debounce_ms,
+                maintenance_interval_seconds,
+                once,
+            } => {
+                let project_root = resolve_path(path)?;
+                println!("cyClaw 独立观察器已启动");
+                println!("项目根目录: {}", project_root.display());
+                println!("事件源: 文件系统、Git 快照、测试与构建报告、事实证据");
+                let initial = observe_project_once(&project_root)?;
+                print_observer_tick(&initial);
+                if once {
+                    return Ok(());
+                }
+
+                let debounce = Duration::from_millis(debounce_ms.max(100));
+                let maintenance = Duration::from_secs(maintenance_interval_seconds.max(30));
+                let (sender, receiver) = mpsc::sync_channel(256);
+                let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
+                    let _ = sender.try_send(event);
+                })?;
+                watcher.watch(&project_root, RecursiveMode::Recursive)?;
+                loop {
+                    match receiver.recv_timeout(maintenance) {
+                        Ok(Ok(event)) => {
+                            if !is_relevant_watch_event(&project_root, &event) {
+                                continue;
+                            }
+                            let mut paths = event.paths;
+                            thread::sleep(debounce);
+                            while let Ok(Ok(next)) = receiver.try_recv() {
+                                paths.extend(next.paths);
+                            }
+                            let artifact_events =
+                                observe_execution_artifacts(&project_root, &paths)?;
+                            let tick = observe_project_once(&project_root)?;
+                            if tick.watch.changed || artifact_events > 0 {
+                                print_observer_tick(&tick);
+                                if artifact_events > 0 {
+                                    println!("自动采集失败报告: {}", artifact_events);
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => eprintln!("文件观察事件异常: {}", error),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let (verified, report) = maintain_project_knowledge(&project_root)?;
+                            println!(
+                                "Observer 周期维护完成: 验证事实 {} 条，重复 {}，冲突 {}，失效 {}，漂移 {}",
+                                verified,
+                                report.duplicate_count,
+                                report.conflict_count,
+                                report.stale_count,
+                                report.drift_count
+                            );
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            anyhow::bail!("文件观察通道意外关闭");
+                        }
+                    }
+                }
+            }
+            ObserverCommand::Status { path } => {
+                let project_root = resolve_path(path)?;
+                let state_path = cyclaw_core::observer_state_path(&project_root);
+                if !state_path.exists() {
+                    println!("Observer 尚未在此项目运行");
+                } else {
+                    println!("{}", fs::read_to_string(state_path)?);
+                }
+            }
+            ObserverCommand::Install { path } => {
+                let project_root = resolve_path(path)?;
+                install_observer_task(&project_root)?;
+            }
+            ObserverCommand::Uninstall { path } => {
+                let project_root = resolve_path(path)?;
+                uninstall_observer_task(&project_root)?;
+            }
+        },
         Commands::Watch {
             path,
             interval,
@@ -839,7 +947,7 @@ fn main() -> Result<()> {
             once,
         } => {
             let project_root = resolve_path(path)?;
-            println!("cyClaw 本地知识智能体已启动");
+            println!("cyClaw watch 为兼容入口；生产环境请使用 `cyclaw observer run`");
             println!("项目根目录: {}", project_root.display());
             println!("监听模式: 文件系统事件 + Git 增量快照");
 
@@ -1380,10 +1488,10 @@ fn main() -> Result<()> {
                 for step in &result.record.steps {
                     println!("- {} [{:?}] {}", step.name, step.status, step.detail);
                 }
-                if let Some(response) = &result.record.model_response {
+                if let Some(summary) = &result.record.model_response_summary {
                     println!();
-                    println!("模型建议:");
-                    println!("{}", response);
+                    println!("模型响应摘要:");
+                    println!("{}", summary);
                 }
             }
             AgentCommand::Runs { command } => match command {
@@ -1560,24 +1668,8 @@ fn main() -> Result<()> {
                     render_bool(policy.permissions.allow_network)
                 );
                 println!(
-                    "允许 Shell: {}",
-                    render_bool(policy.permissions.allow_shell)
-                );
-                println!(
-                    "允许写源码: {}",
-                    render_bool(policy.permissions.allow_code_write)
-                );
-                println!(
                     "允许应用文档: {}",
                     render_bool(policy.permissions.allow_docs_apply)
-                );
-                println!(
-                    "允许自动管理文档: {}",
-                    render_bool(policy.permissions.allow_auto_apply_docs)
-                );
-                println!(
-                    "自动写入最低置信度: {}",
-                    policy.automation.auto_apply_min_confidence
                 );
                 println!(
                     "模型最大上下文字符: {}",
@@ -1651,34 +1743,6 @@ fn main() -> Result<()> {
                     render_bool(policy.permissions.allow_docs_apply)
                 );
             }
-            PolicyCommand::EnableAutoDocs { path } => {
-                let project_root = resolve_path(path)?;
-                set_permission(&project_root, "allow_docs_apply", true)?;
-                let policy = set_permission(&project_root, "allow_auto_apply_docs", true)?;
-                append_cli_event(
-                    &project_root,
-                    cyclaw_events::AgentEventType::PolicyChanged,
-                    "启用自动文档管理权限",
-                    serde_json::json!({ "allow_docs_apply": true, "allow_auto_apply_docs": true }),
-                )?;
-                println!("已启用自动文档管理");
-                println!(
-                    "文档写入: {}",
-                    render_bool(policy.permissions.allow_docs_apply)
-                );
-                println!(
-                    "自动管理文档: {}",
-                    render_bool(policy.permissions.allow_auto_apply_docs)
-                );
-            }
-            PolicyCommand::SetAutoThreshold { confidence, path } => {
-                let project_root = resolve_path(path)?;
-                let policy = set_auto_apply_min_confidence(&project_root, confidence)?;
-                println!(
-                    "自动写入最低置信度已设置为: {}",
-                    policy.automation.auto_apply_min_confidence
-                );
-            }
         },
         Commands::Events { command } => match command {
             EventsCommand::List { path, limit } => {
@@ -1720,6 +1784,78 @@ fn resolve_path(path: Option<PathBuf>) -> Result<PathBuf> {
         None => std::env::current_dir()?,
     };
     Ok(path.canonicalize()?)
+}
+
+fn observer_task_name(project_root: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    project_root.to_string_lossy().hash(&mut hasher);
+    format!("cyClaw Observer {:016x}", hasher.finish())
+}
+
+fn install_observer_task(project_root: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let executable = std::env::current_exe()?;
+        let task_name = observer_task_name(project_root);
+        let command = format!(
+            "\"{}\" observer run --path \"{}\"",
+            executable.display(),
+            project_root.display()
+        );
+        let output = Command::new("schtasks")
+            .args([
+                "/Create", "/TN", &task_name, "/TR", &command, "/SC", "ONLOGON", "/F",
+            ])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "无法安装 Observer 计划任务: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let start = Command::new("schtasks")
+            .args(["/Run", "/TN", &task_name])
+            .output()?;
+        if !start.status.success() {
+            anyhow::bail!(
+                "Observer 任务已安装但无法立即启动: {}",
+                String::from_utf8_lossy(&start.stderr).trim()
+            );
+        }
+        println!("已安装并启动独立 Observer: {}", task_name);
+        println!("项目: {}", project_root.display());
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = project_root;
+        anyhow::bail!(
+            "当前版本仅提供 Windows 任务计划安装；请以服务管理器运行 `cyclaw observer run`"
+        );
+    }
+}
+
+fn uninstall_observer_task(project_root: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let task_name = observer_task_name(project_root);
+        let output = Command::new("schtasks")
+            .args(["/Delete", "/TN", &task_name, "/F"])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "无法卸载 Observer 计划任务: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        println!("已卸载独立 Observer: {}", task_name);
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = project_root;
+        anyhow::bail!("当前版本仅提供 Windows 任务计划卸载");
+    }
 }
 
 fn new_fact(
@@ -1817,7 +1953,7 @@ fn run_hook_event(project_root: &Path, event: &str, strict: bool) -> Result<()> 
                 }),
             )?;
             if strict && high_pending > 0 {
-                anyhow::bail!("存在 {} 个高置信度知识候选尚未处理", high_pending);
+                println!("严格模式不再因推断型知识候选阻止提交；候选已交由 Observer 治理。");
             }
             return Ok(());
         }
@@ -1994,17 +2130,42 @@ fn print_watch_tick(tick: cyclaw_core::WatchTick) {
     }
 }
 
+fn print_observer_tick(tick: &cyclaw_core::ObserverTick) {
+    println!(
+        "Observer 补偿结果: 初始化={} 扫描={} 索引={} 变更={} 验证事实={}",
+        render_bool(tick.initialized),
+        render_bool(tick.scanned),
+        render_bool(tick.indexed),
+        render_bool(tick.watch.changed),
+        tick.verified_facts
+    );
+    if let Some(inbox) = &tick.watch.inbox_result {
+        println!("新增待验证候选: {}", inbox.added.len());
+    }
+    if let Some(report) = &tick.reconciliation {
+        println!(
+            "知识对账: 重复 {}，冲突 {}，失效 {}，漂移 {}",
+            report.duplicate_count, report.conflict_count, report.stale_count, report.drift_count
+        );
+    }
+    println!("观察器状态: {}", tick.state_path.display());
+}
+
 fn is_relevant_watch_event(project_root: &Path, event: &Event) -> bool {
     event.paths.iter().any(|path| {
         let relative = path.strip_prefix(project_root).unwrap_or(path);
         let normalized = relative.to_string_lossy().replace('\\', "/");
+        let execution_report = normalized.contains("surefire-reports")
+            || normalized.contains("test-results")
+            || normalized.contains("junit")
+            || normalized.contains("reports/tests");
         let ignored_component = relative.components().any(|component| {
             matches!(
                 component.as_os_str().to_string_lossy().as_ref(),
                 ".git" | ".cyclaw" | "node_modules" | "target" | "build" | "dist" | ".gradle"
             )
         });
-        !ignored_component && !normalized.starts_with("apps/vscode/bin/")
+        (execution_report || !ignored_component) && !normalized.starts_with("apps/vscode/bin/")
     })
 }
 

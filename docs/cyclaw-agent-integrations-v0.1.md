@@ -38,10 +38,9 @@ MCP 写操作只经过 Rust Core，不允许任意 Shell 或任意文件写入�
 - `get_candidate_detail`、`review_candidate`：查看证据并审阅候选。
 - `preview_document_patch`：生成或复用草稿，但不修改目标文档。
 - `apply_document_patch`、`revert_document_patch`：应用或撤销受策略保护的文档变更。
-- `run_agent`、`set_runtime_strategy`：运行 Agent 和切换项目策略。
-- `begin_task`、`get_task_context`：创建任务边界并按预算召回项目事实。
-- `record_decision`、`record_failed_approach`、`checkpoint_task`：保存执行过程中值得跨会话保留的事实。
-- `reconcile_project_knowledge`、`close_task`：对账重复、冲突和失效知识并完成任务收尾。
+- `run_agent`、`set_runtime_strategy`：兼容性的批处理审阅与策略设置，不承担事件采集职责。
+- 任务、决策和检查点接口：人工补录或历史兼容，不要求 Coding Agent 调用。
+- `reconcile_project_knowledge`：手动诊断入口；独立 Observer 会自动对账。
 
 ## 3. Skills
 
@@ -49,8 +48,8 @@ MCP 写操作只经过 Rust Core，不允许任意 Shell 或任意文件写入�
 
 | Skill | 使用时机 |
 | --- | --- |
-| `cyclaw-project-knowledge` | API、Schema、依赖、配置、架构或部署变化后 |
-| `cyclaw-session-close` | 长任务结束、交接、提交或 PR 前 |
+| `cyclaw-project-knowledge` | 需要人工审批或修正 Observer 产出的知识 Patch 时 |
+| `cyclaw-session-close` | 仅用于人工审核，不作为编码任务的强制收尾 |
 | `cyclaw-doc-audit` | 发布、重大合并、架构评审和定期文档漂移审计 |
 
 安装到目标项目：
@@ -63,19 +62,17 @@ Codex 使用 `.agents/skills/`，Claude Code 使用 `.claude/skills/`。脚本�
 
 ## 4. Codex 集成
 
-Codex 侧采用：
+Codex 侧只作为读取与审批界面；项目自主性来自单独运行的 Observer：
 
 ```text
-MCP + 项目级 Skills + AGENTS.md 收尾约定
+cyclaw observer run + MCP（只读/审批）+ 可选 Skills
 ```
 
-推荐的 Agent 工作顺序：
+独立运行顺序：
 
 ```text
-get_active_task -> begin_task -> get_task_context
--> 编码与验证
--> record_decision / record_failed_approach / checkpoint_task
--> reconcile_project_knowledge -> close_task
+Observer 启动补偿 -> 文件/Git/报告事件
+-> 候选与证据 -> 自动验证与对账 -> Patch 审批
 ```
 
 只有真正影响后续工作的约束、决策、失败路径和验证结论才进入 Fact Ledger；普通过程日志不应写入长期记忆。
@@ -88,13 +85,13 @@ get_active_task -> begin_task -> get_task_context
 
 全局注册只保存 `cyclaw.exe mcp`，不固定项目路径。Codex 从当前工作目录启动 MCP，每个项目继续使用自己的 `.cyclaw/`。新增 MCP 配置只会在新会话或 Codex 重启后加载。
 
-建议在目标项目 `AGENTS.md` 中加入：
+建议在目标项目部署独立 Observer，而不是要求 `AGENTS.md` 驱动 Coding Agent：
 
 ```markdown
-完成涉及 API、Schema、依赖、配置、架构或部署的任务前，使用 cyClaw MCP 执行一次知识检查。长任务结束时使用 cyclaw-session-close；先预览文档草稿，再按当前权限和运行策略决定是否应用。
+以独立进程运行 `cyclaw observer run --path <项目根目录>`。Coding Agent 仅在需要时读取候选、预览 Patch 或审批文档变更。
 ```
 
-不要假设 Codex 与 Claude Code 具有完全相同的生命周期 Hook 配置。Codex 的稳定接入点是 MCP、Skills、项目指令和提交前 Git Hook。
+不要把 Codex、Claude Code 或 IDE 生命周期 Hook 当作知识采集前提；它们只是可选的管理和展示入口。
 
 ## 5. Claude Code 集成
 

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cyclaw_agent::{AgentRunOptions, run_agent_once};
+use cyclaw_core::TaskPhase;
 use cyclaw_core::{
     BeginTaskOptions, DraftOptions, FactEvidence, FactInput, FactOperation, FactPatchQuery,
     FactPatchRequest, FactPatchStatus, FactType, ProjectFact, SearchOptions,
@@ -19,28 +20,38 @@ use cyclaw_core::{
     preview_fact_patch as preview_fact_patch_core, project_fact_from_input, project_status,
     query_evidence_verifications as core_query_evidence_verifications,
     query_fact_patches as core_query_fact_patches,
-    reconcile_project_knowledge as core_reconcile_project_knowledge, record_task_decision,
-    record_task_failed_approach, recover_fact_patch_transactions as recover_fact_transactions,
+    reconcile_project_knowledge as core_reconcile_project_knowledge, record_execution_event,
+    record_task_decision, record_task_failed_approach,
+    recover_fact_patch_transactions as recover_fact_transactions,
     revert_document_patch as revert_patch, revert_fact_patch as revert_fact_patch_core,
-    search_project, update_inbox_status, verify_fact_evidence as verify_fact_evidence_core,
-    watch_project_once,
+    search_project, set_task_phase as set_project_task_phase, update_inbox_status,
+    verify_fact_evidence as verify_fact_evidence_core, watch_project_once,
 };
 use cyclaw_docs::{DocumentPatchStatus, KnowledgeOperation};
-use cyclaw_events::read_events;
+use cyclaw_events::{ExecutionEventKind, new_execution_event, read_events};
 use cyclaw_knowledge::KnowledgeStatus;
 use cyclaw_model::list_providers;
-use cyclaw_policy::{load_or_default, set_auto_apply_min_confidence, set_permission};
+use cyclaw_policy::{load_or_default, set_permission};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
 pub struct McpServerOptions {
     pub project_root: PathBuf,
+    pub recover_transactions_on_startup: bool,
 }
 
 impl McpServerOptions {
     pub fn new(project_root: PathBuf) -> Self {
-        Self { project_root }
+        Self {
+            project_root,
+            recover_transactions_on_startup: false,
+        }
+    }
+
+    pub fn with_transaction_recovery(mut self) -> Self {
+        self.recover_transactions_on_startup = true;
+        self
     }
 }
 
@@ -56,8 +67,9 @@ where
     W: Write,
 {
     let mut transport = McpTransport::new(reader);
-    // 坏事务由 doctor 报告，不能阻止 MCP 启动和只读诊断。
-    let _ = recover_fact_transactions(&options.project_root)?;
+    if options.recover_transactions_on_startup {
+        recover_fact_transactions(&options.project_root)?;
+    }
     let server = McpServer::new(options.project_root);
 
     while let Some(request) = transport.next_message()? {
@@ -185,6 +197,7 @@ impl McpServer {
                 "inputSchema": object_schema(vec![("limit", json!({ "type": "integer", "minimum": 1, "maximum": 50 }))])
             }),
             json!({"name":"analyze_changes","description":"执行一次增量知识分析，生成新的候选知识。","inputSchema":object_schema(vec![])}),
+            json!({"name":"record_execution_event","description":"记录构建、测试、命令或 Patch 的执行结果；失败仅生成待审知识候选，不直接写入 Fact。","inputSchema":object_schema_with_required(vec![("kind",json!({"type":"string","enum":["command","build","test","patch"]})),("command_summary",json!({"type":"string","maxLength":500})),("exit_code",json!({"type":"integer"})),("timed_out",json!({"type":"boolean"})),("error_summary",json!({"type":"string","maxLength":2000})),("related_files",json!({"type":"array","items":{"type":"string"},"maxItems":50}))], &["kind","command_summary"])}),
             json!({"name":"get_candidate_detail","description":"按 ID 读取候选知识、证据和已有草稿。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"}))])}),
             json!({"name":"preview_document_patch","description":"为候选生成或读取文档草稿，支持 create/update/merge/supersede/delete，不修改目标文档。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"})),("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("selector",json!({"type":"string","description":"Markdown 章节标题或 candidate:<ID>"})),("source_selectors",json!({"type":"array","items":{"type":"string"}})),("replacement_content",json!({"type":"string"})),("delete_target_document",json!({"type":"boolean"}))])}),
             json!({"name":"review_candidate","description":"接受或忽略候选；接受时可用五种知识操作生成草稿。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"})),("action",json!({"type":"string","enum":["accept","ignore"]})),("generate_draft",json!({"type":"boolean"})),("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("selector",json!({"type":"string"})),("source_selectors",json!({"type":"array","items":{"type":"string"}})),("replacement_content",json!({"type":"string"})),("delete_target_document",json!({"type":"boolean"}))])}),
@@ -203,7 +216,7 @@ impl McpServer {
             fact_operation_tool("supersede_fact", "生成取代事实草稿", true, false),
             fact_operation_tool("delete_fact", "生成逻辑删除事实草稿", true, false),
             json!({"name":"run_agent","description":"运行一次 cyClaw Agent，可选择是否调用活动模型。","inputSchema":object_schema(vec![("use_model",json!({"type":"boolean"})),("provider",json!({"type":"string"}))])}),
-            json!({"name":"set_runtime_strategy","description":"设置观察、审阅、智能审阅或自动文档策略。","inputSchema":object_schema(vec![("strategy",json!({"type":"string","enum":["observe","review","smart","auto"]})),("auto_apply_min_confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
+            json!({"name":"set_runtime_strategy","description":"设置观察、人工审阅或模型辅助审阅策略；不会自动写入项目文档。","inputSchema":object_schema(vec![("strategy",json!({"type":"string","enum":["observe","review","smart"]}))])}),
             json!({"name":"doctor","description":"诊断 Git、配置、模型、权限、知识目录和文档写入状态。","inputSchema":object_schema(vec![])}),
             json!({"name":"begin_task","description":"开始一个项目任务，并返回首个带证据的上下文包。","inputSchema":object_schema(vec![("title",json!({"type":"string"})),("objective",json!({"type":"string"})),("related_files",json!({"type":"array","items":{"type":"string"}})),("context_budget_tokens",json!({"type":"integer","minimum":256,"maximum":16000}))])}),
             json!({"name":"get_active_task","description":"读取当前活动任务；没有活动任务时返回 null。","inputSchema":object_schema(vec![])}),
@@ -211,6 +224,7 @@ impl McpServer {
             json!({"name":"record_decision","description":"把任务中的关键决策写入任务记录和结构化 Fact Ledger。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("statement",json!({"type":"string"})),("rationale",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}})),("confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
             json!({"name":"record_failed_approach","description":"记录尝试过但失败的方案、原因和证据，供后续会话避免重复。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("approach",json!({"type":"string"})),("reason",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}}))])}),
             json!({"name":"checkpoint_task","description":"记录长任务检查点、当前结论和相关文件。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("summary",json!({"type":"string"})),("related_files",json!({"type":"array","items":{"type":"string"}}))])}),
+            json!({"name":"set_task_phase","description":"切换当前任务阶段。","inputSchema":object_schema_with_required(vec![("task_id",json!({"type":"string"})),("phase",json!({"type":"string","enum":["investigate","design","implement","verify","handoff"]}))], &["phase"])}),
             json!({"name":"reconcile_project_knowledge","description":"检测结构化事实中的重复、冲突、证据漂移和失效，并推荐 merge/supersede/update/delete。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"}))])}),
             json!({"name":"close_task","description":"关闭当前任务，可同时执行知识对账并返回交接信息。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("summary",json!({"type":"string"})),("reconcile",json!({"type":"boolean"}))])}),
             json!({"name":"list_project_facts","description":"读取结构化项目事实，可按状态限制数量。","inputSchema":object_schema(vec![("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
@@ -285,6 +299,7 @@ impl McpServer {
             "list_events" => self.list_events(arguments)?,
             "list_agent_runs" => self.list_agent_runs(arguments)?,
             "analyze_changes" => self.analyze_changes()?,
+            "record_execution_event" => self.record_execution_event(arguments)?,
             "get_candidate_detail" => self.get_candidate_detail(arguments)?,
             "preview_document_patch" => self.preview_document_patch(arguments)?,
             "review_candidate" => self.review_candidate(arguments)?,
@@ -311,6 +326,7 @@ impl McpServer {
             "record_decision" => self.record_decision(arguments)?,
             "record_failed_approach" => self.record_failed_approach(arguments)?,
             "checkpoint_task" => self.checkpoint_task(arguments)?,
+            "set_task_phase" => self.set_task_phase(arguments)?,
             "reconcile_project_knowledge" => self.reconcile_project_knowledge(arguments)?,
             "close_task" => self.close_task(arguments)?,
             "list_project_facts" => self.list_project_facts(arguments)?,
@@ -502,6 +518,41 @@ impl McpServer {
             "added_candidates": added,
             "auto_applied_patches": tick.auto_applied_patches
         }))
+    }
+
+    fn record_execution_event(&self, arguments: Value) -> Result<Value> {
+        let kind = match required_string(&arguments, "kind")? {
+            "command" => ExecutionEventKind::Command,
+            "build" => ExecutionEventKind::Build,
+            "test" => ExecutionEventKind::Test,
+            "patch" => ExecutionEventKind::Patch,
+            value => anyhow::bail!("未知执行事件类型: {}", value),
+        };
+        let command_summary = required_string(&arguments, "command_summary")?;
+        let exit_code = arguments
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .map(|value| value as i32);
+        let timed_out = arguments
+            .get("timed_out")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let error_summary = arguments
+            .get("error_summary")
+            .and_then(Value::as_str)
+            .map(|value| value.chars().take(2000).collect());
+        let related_files = optional_string_array(&arguments, "related_files")?;
+        let event = new_execution_event(
+            "mcp",
+            kind,
+            command_summary,
+            exit_code,
+            timed_out,
+            related_files,
+            error_summary,
+        );
+        let result = record_execution_event(self.project_root.clone(), event)?;
+        Ok(json!({"duplicate":result.duplicate,"candidate":result.candidate}))
     }
 
     fn get_candidate_detail(&self, arguments: Value) -> Result<Value> {
@@ -831,23 +882,16 @@ impl McpServer {
 
     fn set_runtime_strategy(&self, arguments: Value) -> Result<Value> {
         let strategy = required_string(&arguments, "strategy")?;
-        let (docs, model, auto) = match strategy {
-            "observe" => (false, false, false),
-            "review" => (true, false, false),
-            "smart" => (true, true, false),
-            "auto" => (true, true, true),
+        let (docs, model) = match strategy {
+            "observe" => (false, false),
+            "review" => (true, false),
+            "smart" => (true, true),
             _ => anyhow::bail!("未知运行策略: {}", strategy),
         };
         set_permission(&self.project_root, "allow_docs_apply", docs)?;
         set_permission(&self.project_root, "allow_model_call", model)?;
         set_permission(&self.project_root, "allow_network", model)?;
-        let mut policy = set_permission(&self.project_root, "allow_auto_apply_docs", auto)?;
-        if let Some(confidence) = arguments
-            .get("auto_apply_min_confidence")
-            .and_then(Value::as_u64)
-        {
-            policy = set_auto_apply_min_confidence(&self.project_root, confidence.min(100) as u8)?;
-        }
+        let policy = load_or_default(&self.project_root)?;
         Ok(json!({ "strategy": strategy, "policy": policy }))
     }
 
@@ -901,6 +945,9 @@ impl McpServer {
         let title = required_string(&arguments, "title")?.to_string();
         let objective = required_string(&arguments, "objective")?.to_string();
         let mut options = BeginTaskOptions::new(self.project_root.clone(), title, objective);
+        if let Some(phase) = arguments.get("phase").and_then(Value::as_str) {
+            options.phase = parse_task_phase(phase)?;
+        }
         options.related_files = optional_string_array(&arguments, "related_files")?;
         options.context_budget_tokens = arguments
             .get("context_budget_tokens")
@@ -984,6 +1031,12 @@ impl McpServer {
             summary,
             related_files,
         )?}))
+    }
+
+    fn set_task_phase(&self, arguments: Value) -> Result<Value> {
+        let task_id = arguments.get("task_id").and_then(Value::as_str);
+        let phase = parse_task_phase(required_string(&arguments, "phase")?)?;
+        Ok(json!({"task":set_project_task_phase(&self.project_root, task_id, phase)?}))
     }
 
     fn reconcile_project_knowledge(&self, arguments: Value) -> Result<Value> {
@@ -1276,6 +1329,17 @@ fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
         .with_context(|| format!("缺少字符串参数: {}", name))
 }
 
+fn parse_task_phase(value: &str) -> Result<TaskPhase> {
+    match value {
+        "investigate" => Ok(TaskPhase::Investigate),
+        "design" => Ok(TaskPhase::Design),
+        "implement" => Ok(TaskPhase::Implement),
+        "verify" => Ok(TaskPhase::Verify),
+        "handoff" => Ok(TaskPhase::Handoff),
+        _ => anyhow::bail!("未知任务阶段: {}", value),
+    }
+}
+
 fn optional_usize(arguments: &Value, name: &str, default: usize) -> usize {
     arguments
         .get(name)
@@ -1307,6 +1371,7 @@ fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
         "analyze_changes"
+            | "record_execution_event"
             | "preview_document_patch"
             | "review_candidate"
             | "apply_document_patch"
@@ -1326,6 +1391,7 @@ fn is_write_tool(name: &str) -> bool {
             | "record_decision"
             | "record_failed_approach"
             | "checkpoint_task"
+            | "set_task_phase"
             | "reconcile_project_knowledge"
             | "close_task"
     )
@@ -1355,7 +1421,11 @@ fn collect_resource_files(
     {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
             collect_resource_files(project_root, &path, label, mime_type, resources)?;
             continue;
         }

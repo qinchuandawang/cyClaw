@@ -73,12 +73,16 @@ fn visit_dir(project_root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Resul
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
 
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
             if should_ignore_dir(&file_name) {
                 continue;
             }
             visit_dir(project_root, &path, files)?;
-        } else if path.is_file() {
+        } else if metadata.is_file() {
             let relative = path.strip_prefix(project_root)?.to_path_buf();
             files.push(relative);
         }

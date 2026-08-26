@@ -89,10 +89,7 @@ pub struct PermissionConfig {
     pub denied_paths: Vec<String>,
     pub allow_model_call: bool,
     pub allow_network: bool,
-    pub allow_shell: bool,
-    pub allow_code_write: bool,
     pub allow_docs_apply: bool,
-    pub allow_auto_apply_docs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,13 +105,7 @@ pub struct ModelPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AutomationPolicy {
-    pub auto_watch: bool,
-    pub auto_generate_inbox: bool,
-    pub auto_generate_draft: bool,
-    pub auto_apply_docs: bool,
-    pub auto_apply_min_confidence: u8,
-}
+pub struct AutomationPolicy {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyCheck {
@@ -159,47 +150,13 @@ pub fn set_permission(project_root: &Path, key: &str, enabled: bool) -> Result<P
         .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
         .as_mapping_mut()
         .with_context(|| "permissions 不是 YAML 对象")?;
-    let allowed = [
-        "allow_model_call",
-        "allow_network",
-        "allow_shell",
-        "allow_code_write",
-        "allow_docs_apply",
-        "allow_auto_apply_docs",
-    ];
+    let allowed = ["allow_model_call", "allow_network", "allow_docs_apply"];
     if !allowed.contains(&key) {
         anyhow::bail!("不支持的权限开关: {}", key);
     }
     permissions.insert(
         serde_yaml::Value::String(key.to_string()),
         serde_yaml::Value::Bool(enabled),
-    );
-    fs::write(&path, serde_yaml::to_string(&value)?)?;
-    load_or_default(project_root)
-}
-
-pub fn set_auto_apply_min_confidence(project_root: &Path, confidence: u8) -> Result<PolicyConfig> {
-    let _lock = acquire_lock(project_root, "policy", Duration::from_secs(5))?;
-    let path = policy_path(project_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut value = if path.exists() {
-        serde_yaml::from_str::<serde_yaml::Value>(&fs::read_to_string(&path)?)?
-    } else {
-        serde_yaml::to_value(default_policy())?
-    };
-    let mapping = value
-        .as_mapping_mut()
-        .context("cyClaw 配置不是 YAML 对象")?;
-    let automation = mapping
-        .entry(serde_yaml::Value::String("automation".to_string()))
-        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
-        .as_mapping_mut()
-        .context("automation 不是 YAML 对象")?;
-    automation.insert(
-        serde_yaml::Value::String("auto_apply_min_confidence".to_string()),
-        serde_yaml::Value::Number(confidence.min(100).into()),
     );
     fs::write(&path, serde_yaml::to_string(&value)?)?;
     load_or_default(project_root)
@@ -283,10 +240,7 @@ pub fn default_policy() -> PolicyConfig {
             ],
             allow_model_call: false,
             allow_network: false,
-            allow_shell: false,
-            allow_code_write: false,
             allow_docs_apply: false,
-            allow_auto_apply_docs: false,
         },
         model_policy: ModelPolicy {
             max_context_chars: 30000,
@@ -298,13 +252,7 @@ pub fn default_policy() -> PolicyConfig {
             max_retries: 2,
             min_interval_millis: 100,
         },
-        automation: AutomationPolicy {
-            auto_watch: true,
-            auto_generate_inbox: true,
-            auto_generate_draft: false,
-            auto_apply_docs: false,
-            auto_apply_min_confidence: 90,
-        },
+        automation: AutomationPolicy {},
     }
 }
 
@@ -332,29 +280,11 @@ fn policy_from_yaml(value: serde_yaml::Value) -> PolicyConfig {
         {
             policy.permissions.allow_network = allow_network;
         }
-        if let Some(allow_shell) = permissions
-            .get("allow_shell")
-            .and_then(|value| value.as_bool())
-        {
-            policy.permissions.allow_shell = allow_shell;
-        }
-        if let Some(allow_code_write) = permissions
-            .get("allow_code_write")
-            .and_then(|value| value.as_bool())
-        {
-            policy.permissions.allow_code_write = allow_code_write;
-        }
         if let Some(allow_docs_apply) = permissions
             .get("allow_docs_apply")
             .and_then(|value| value.as_bool())
         {
             policy.permissions.allow_docs_apply = allow_docs_apply;
-        }
-        if let Some(allow_auto_apply_docs) = permissions
-            .get("allow_auto_apply_docs")
-            .and_then(|value| value.as_bool())
-        {
-            policy.permissions.allow_auto_apply_docs = allow_auto_apply_docs;
         }
     }
     if let Some(model_policy) = value.get("model_policy") {
@@ -406,13 +336,6 @@ fn policy_from_yaml(value: serde_yaml::Value) -> PolicyConfig {
         {
             policy.model_policy.min_interval_millis = value;
         }
-    }
-    if let Some(automation) = value.get("automation")
-        && let Some(value) = automation
-            .get("auto_apply_min_confidence")
-            .and_then(|value| value.as_u64())
-    {
-        policy.automation.auto_apply_min_confidence = value.min(100) as u8;
     }
     policy
 }
@@ -478,20 +401,5 @@ mod tests {
         let result = check_write_path_with_policy(&policy, ".env", PermissionLevel::DocsWrite);
 
         assert!(!result.allowed);
-    }
-
-    #[test]
-    fn persists_auto_apply_confidence_threshold() {
-        let temp = tempfile::tempdir().unwrap();
-        let policy = set_auto_apply_min_confidence(temp.path(), 86).unwrap();
-
-        assert_eq!(policy.automation.auto_apply_min_confidence, 86);
-        assert_eq!(
-            load_or_default(temp.path())
-                .unwrap()
-                .automation
-                .auto_apply_min_confidence,
-            86
-        );
     }
 }

@@ -101,6 +101,8 @@ pub fn analyze_git_changes(project_root: &Path) -> Result<ChangeAnalysis> {
     let mut changed_files = parse_name_status(&name_status_output);
     changed_files.extend(parse_name_status(&cached_name_status_output));
     changed_files.extend(parse_untracked_from_status(&status_output));
+    // cyClaw 自己的事件、索引和游标不是被观察项目的业务变更，避免 Observer 自激循环。
+    changed_files.retain(|file| !is_cyclaw_managed_path(&file.path));
     changed_files.sort_by(|left, right| left.path.cmp(&right.path));
     changed_files.dedup_by(|left, right| left.path == right.path);
 
@@ -142,6 +144,7 @@ pub fn git_change_snapshot(project_root: &Path) -> Result<GitChangeSnapshot> {
     let mut changed_files = parse_name_status(&name_status_output);
     changed_files.extend(parse_name_status(&cached_name_status_output));
     changed_files.extend(parse_untracked_from_status(&status_output));
+    changed_files.retain(|file| !is_cyclaw_managed_path(&file.path));
     changed_files.sort_by(|left, right| left.path.cmp(&right.path));
     changed_files.dedup_by(|left, right| left.path == right.path);
 
@@ -196,6 +199,17 @@ pub fn changed_paths_since(
         .filter(|path| previous.files.get(*path) != current.files.get(*path))
         .cloned()
         .collect()
+}
+
+fn is_cyclaw_managed_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == ".cyclaw"
+        || normalized.starts_with(".cyclaw/")
+        || normalized.starts_with("target/")
+        || normalized.starts_with("node_modules/")
+        || normalized.starts_with("build/")
+        || normalized.starts_with("dist/")
+        || normalized.starts_with(".gradle/")
 }
 
 pub fn filter_change_analysis(

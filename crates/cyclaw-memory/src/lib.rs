@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use cyclaw_events::{AgentEventType, append_event, new_event};
+use cyclaw_events::{AgentEventType, append_event, new_event, new_id};
 use cyclaw_policy::acquire_lock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -56,6 +56,29 @@ pub struct TaskCheckpoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Investigate,
+    Design,
+    Implement,
+    Verify,
+    Handoff,
+}
+
+impl Default for TaskPhase {
+    fn default() -> Self {
+        Self::Investigate
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskActivity {
+    pub kind: String,
+    pub summary: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRecord {
     pub id: String,
     pub title: String,
@@ -63,6 +86,12 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     pub related_files: Vec<String>,
     pub context_budget_tokens: usize,
+    #[serde(default)]
+    pub phase: TaskPhase,
+    #[serde(default)]
+    pub phase_summary: String,
+    #[serde(default)]
+    pub recent_activity: Vec<TaskActivity>,
     pub decisions: Vec<TaskDecision>,
     pub failed_approaches: Vec<FailedApproach>,
     pub checkpoints: Vec<TaskCheckpoint>,
@@ -80,6 +109,7 @@ pub struct BeginTaskOptions {
     pub objective: String,
     pub related_files: Vec<String>,
     pub context_budget_tokens: usize,
+    pub phase: TaskPhase,
     pub git_head: Option<String>,
 }
 
@@ -91,6 +121,7 @@ impl BeginTaskOptions {
             objective,
             related_files: Vec::new(),
             context_budget_tokens: 2_000,
+            phase: TaskPhase::default(),
             git_head: None,
         }
     }
@@ -537,12 +568,15 @@ pub fn begin_task(options: BeginTaskOptions) -> Result<TaskRecord> {
     }
     let now = Utc::now().to_rfc3339();
     let task = TaskRecord {
-        id: task_id(&options.title, &now),
+        id: new_id("task"),
         title: options.title,
         objective: options.objective,
         status: TaskStatus::Active,
         related_files: dedupe_strings(options.related_files),
         context_budget_tokens: options.context_budget_tokens.clamp(256, 16_000),
+        phase: options.phase,
+        phase_summary: String::new(),
+        recent_activity: Vec::new(),
         decisions: Vec::new(),
         failed_approaches: Vec::new(),
         checkpoints: Vec::new(),
@@ -572,6 +606,25 @@ pub fn get_active_task(project_root: &Path) -> Result<Option<TaskRecord>> {
 
 pub fn get_task(project_root: &Path, task_id: &str) -> Result<TaskRecord> {
     read_task(project_root, task_id)
+}
+
+pub fn set_task_phase(
+    project_root: &Path,
+    task_id: Option<&str>,
+    phase: TaskPhase,
+) -> Result<TaskRecord> {
+    ensure_memory_dirs(project_root)?;
+    let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
+    let id = resolve_task_id(project_root, task_id)?;
+    let mut task = read_task(project_root, &id)?;
+    ensure_active(&task)?;
+    task.phase = phase;
+    let now = Utc::now().to_rfc3339();
+    let activity_summary = format!("进入 {:?} 阶段", task.phase);
+    push_task_activity(&mut task, "phase", activity_summary, now.clone());
+    task.updated_at = now;
+    write_task(project_root, &task)?;
+    Ok(task)
 }
 
 pub fn list_tasks(project_root: &Path, limit: usize) -> Result<Vec<TaskRecord>> {
@@ -613,6 +666,12 @@ pub fn record_decision(
         created_at: now.clone(),
     };
     task.decisions.push(decision);
+    push_task_activity(
+        &mut task,
+        "decision",
+        "记录关键决策".to_string(),
+        now.clone(),
+    );
     task.updated_at = now.clone();
     write_task(project_root, &task)?;
     let fact = upsert_fact(
@@ -664,6 +723,12 @@ pub fn record_failed_approach(
         evidence: dedupe_strings(evidence.clone()),
         created_at: now.clone(),
     });
+    push_task_activity(
+        &mut task,
+        "failure",
+        "记录失败方案".to_string(),
+        now.clone(),
+    );
     task.updated_at = now.clone();
     write_task(project_root, &task)?;
     let fact = upsert_fact(
@@ -711,10 +776,11 @@ pub fn checkpoint_task(
     task.related_files = dedupe_strings(task.related_files);
     task.checkpoints.push(TaskCheckpoint {
         id: item_id("checkpoint", &summary, &now),
-        summary,
+        summary: summary.clone(),
         related_files: files,
         created_at: now.clone(),
     });
+    push_task_activity(&mut task, "checkpoint", summary, now.clone());
     task.updated_at = now;
     write_task(project_root, &task)?;
     record_event(
@@ -2272,6 +2338,37 @@ fn resolve_task_id(project_root: &Path, task_id: Option<&str>) -> Result<String>
     read_active_task_id(project_root)?.context("当前没有活动任务，请先调用 begin_task")
 }
 
+fn push_task_activity(task: &mut TaskRecord, kind: &str, summary: String, created_at: String) {
+    const HOT_WINDOW: usize = 32;
+    task.recent_activity.push(TaskActivity {
+        kind: kind.to_string(),
+        summary,
+        created_at,
+    });
+    if task.recent_activity.len() > HOT_WINDOW {
+        let retired = task.recent_activity.remove(0);
+        let item = format!("[{}] {}", retired.kind, retired.summary);
+        if task.phase_summary.is_empty() {
+            task.phase_summary = item;
+        } else {
+            task.phase_summary.push_str("；");
+            task.phase_summary.push_str(&item);
+        }
+        const SUMMARY_LIMIT: usize = 4_000;
+        if task.phase_summary.chars().count() > SUMMARY_LIMIT {
+            task.phase_summary = task
+                .phase_summary
+                .chars()
+                .rev()
+                .take(SUMMARY_LIMIT)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+        }
+    }
+}
+
 fn ensure_active(task: &TaskRecord) -> Result<()> {
     if task.status != TaskStatus::Active {
         anyhow::bail!("任务已经关闭: {}", task.id);
@@ -2334,19 +2431,6 @@ fn facts_path(project_root: &Path) -> PathBuf {
 
 fn reconciliation_dir(project_root: &Path) -> PathBuf {
     project_root.join(CYCLE_DIR).join("reconciliation")
-}
-
-fn task_id(title: &str, now: &str) -> String {
-    let slug = title
-        .chars()
-        .filter(|value| value.is_ascii_alphanumeric() || *value == '-')
-        .take(32)
-        .collect::<String>();
-    format!(
-        "task_{}_{}",
-        Utc::now().format("%Y%m%d_%H%M%S"),
-        if slug.is_empty() { "work" } else { &slug }
-    ) + &format!("_{:06x}", digest(&(title, now)) as u32 & 0x00ff_ffff)
 }
 
 fn item_id(prefix: &str, value: &str, salt: &str) -> String {
@@ -2882,6 +2966,29 @@ mod tests {
         let context = compile_fact_context(temp.path(), "退款处理中", 500, 10).unwrap();
         assert_eq!(context.facts.len(), 1);
         assert!(context.facts[0].fact.statement.contains("不得重新"));
+    }
+
+    #[test]
+    fn task_activity_uses_bounded_hot_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = begin_task(BeginTaskOptions::new(
+            temp.path().to_path_buf(),
+            "长任务".to_string(),
+            "验证滑动窗口".to_string(),
+        ))
+        .unwrap();
+        for index in 0..35 {
+            checkpoint_task(
+                temp.path(),
+                Some(&task.id),
+                format!("检查点 {}", index),
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        let saved = get_task(temp.path(), &task.id).unwrap();
+        assert_eq!(saved.recent_activity.len(), 32);
+        assert!(saved.phase_summary.contains("检查点 0"));
     }
 
     #[test]
