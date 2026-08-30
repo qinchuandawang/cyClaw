@@ -540,6 +540,9 @@ class CyclawDashboardProvider implements vscode.WebviewViewProvider {
 }
 
 let watchProcess: cp.ChildProcessWithoutNullStreams | undefined;
+let observerRestartTimer: NodeJS.Timeout | undefined;
+let observerRestartAttempts = 0;
+let observerStopRequested = false;
 let outputChannel: vscode.OutputChannel;
 let statusBarItem: vscode.StatusBarItem;
 let extensionRoot: string;
@@ -1231,6 +1234,8 @@ async function startWatch(provider: CyclawKnowledgeProvider): Promise<void> {
     return;
   }
 
+  observerStopRequested = false;
+
   const debounce = workspaceConfiguration(root).get<number>("watchDebounceMilliseconds", 600);
   const command = await resolveCommand(["observer", "run", "--debounce-ms", String(debounce)], root);
   watchProcess = cp.spawn(command.file, command.args, { cwd: command.cwd, env: command.env });
@@ -1247,10 +1252,31 @@ async function startWatch(provider: CyclawKnowledgeProvider): Promise<void> {
     watchProcess = undefined;
     provider.notify();
     refresh(provider);
+    if (!observerStopRequested && code !== 0 && observerRestartAttempts < 3) {
+      const delay = [1000, 5000, 30000][observerRestartAttempts];
+      observerRestartAttempts += 1;
+      outputChannel.appendLine(`Observer 将在 ${delay}ms 后第 ${observerRestartAttempts} 次重启。`);
+      observerRestartTimer = setTimeout(() => {
+        observerRestartTimer = undefined;
+        startWatch(provider).catch((error) => {
+          outputChannel.appendLine(`Observer 重启失败: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }, delay);
+    } else if (code !== 0 && !observerStopRequested) {
+      vscode.window.showErrorMessage("cyClaw Observer 多次启动失败，请查看运行日志。", "打开日志").then((action) => {
+        if (action === "打开日志") showOutput();
+      });
+    }
   });
 }
 
 function stopWatch(provider?: CyclawKnowledgeProvider): void {
+  observerStopRequested = true;
+  observerRestartAttempts = 0;
+  if (observerRestartTimer) {
+    clearTimeout(observerRestartTimer);
+    observerRestartTimer = undefined;
+  }
   if (!watchProcess) {
     return;
   }

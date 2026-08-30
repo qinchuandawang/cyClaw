@@ -32,7 +32,7 @@ class CyclawProjectService(private val project: Project) : Disposable {
 
     fun scanProject(): CyclawCommandResult = runCyclaw("scan")
 
-    fun watchOnce(): CyclawCommandResult = runCyclaw("watch", "--once")
+    fun watchOnce(): CyclawCommandResult = runCyclaw("observer", "run", "--once")
 
     fun acceptCandidate(id: String): CyclawCommandResult = runCyclaw("inbox", "accept", id)
 
@@ -46,7 +46,7 @@ class CyclawProjectService(private val project: Project) : Disposable {
             return
         }
 
-        val commandLine = commandLine(listOf("watch", "--debounce-ms", "600"))
+        val commandLine = commandLine(listOf("observer", "run", "--debounce-ms", "600"))
         val handler = OSProcessHandler(commandLine)
         watchHandler = handler
         handler.addProcessListener(CyclawProcessListener({ text ->

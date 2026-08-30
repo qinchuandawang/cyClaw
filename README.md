@@ -58,6 +58,7 @@ cyclaw task close "任务完成" --path <project-path>
 
 - `.cyclaw/` 包含项目画像、任务、结构化事实、索引、候选、文档草稿和审计事件；默认不应提交到 Git。
 - CLI 只在配置中保存 API Key 环境变量名；VS Code API Key 保存在本机 SecretStorage。
+- 模型响应缓存默认关闭；需要缓存时必须在项目策略中显式开启。
 - 使用外部模型前，确认发送的上下文符合组织数据政策。
 - cyClaw 不会依据路径规则候选自动写入文档；所有写入保留 Patch、事件和撤销能力。
 
@@ -241,6 +242,7 @@ cargo run -p cyclaw-cli -- agent runs clean --keep 20
 - `get_candidate_detail`、`review_candidate`：查看证据并审阅候选。
 - `preview_document_patch`：生成或复用草稿，不修改目标文档。
 - `apply_document_patch`、`revert_document_patch`：应用或撤销通过权限检查的文档变更。
+- `get_model_usage`：读取当日模型调用次数、Token 用量和日预算。
 - `run_agent`、`set_runtime_strategy`：兼容性的批处理审阅与策略设置，不承担事件采集职责。
 - `doctor`：检查 Git、初始化、权限、候选、活动模型和文档写入状态。
 - `begin_task`、`get_active_task`、`get_task_context`：历史兼容的任务上下文读取接口。
@@ -351,8 +353,8 @@ pnpm run compile
 - 提供 `cyClaw` Activity Bar 入口。
 - 展示项目状态、待处理候选知识、待应用文档草稿。
 - 通过 `cyclaw mcp` 读取项目知识。
-- 通过 CLI 执行 `init`、`scan`、`watch --once`。
-- 支持启动和停止 `cyclaw watch` 常驻监听。
+- 通过 CLI 执行 `init`、`scan`、`observer run --once`。
+- 支持启动和停止 `cyclaw observer run` 常驻监听。
 - 支持在候选知识上执行接受、忽略。
 - 支持在文档草稿上执行应用。
 
@@ -379,8 +381,8 @@ apps/idea
 - 提供 `cyClaw` Tool Window。
 - 展示项目状态、待处理候选知识、待应用文档草稿。
 - 通过 `cyclaw mcp` 读取项目知识。
-- 通过 CLI 执行 `init`、`scan`、`watch --once`。
-- 支持启动和停止 `cyclaw watch`。
+- 通过 CLI 执行 `init`、`scan`、`observer run --once`。
+- 支持启动和停止 `cyclaw observer run`。
 - 支持接受、忽略候选知识。
 - 支持应用文档草稿。
 

@@ -277,6 +277,8 @@ cyclaw policy set allow_shell --enabled=false
 
 - 模型调用使用可配置并发槽位，多个进程会排队等待可用槽位；支持请求超时、指数退避和失败重试。
 - `model_policy` 支持读取 `max_concurrent_calls`、`request_timeout_seconds`、`max_retries`、`min_interval_millis`。
+- 模型调用增加 `max_input_tokens`、`max_output_tokens` 和 `daily_token_budget` 门禁；用量写入 `.cyclaw/model-usage.json`，记录调用次数及输入、输出、总 Token。
+- `get_model_usage` MCP 工具暴露当日用量和预算，模型响应中的 Provider usage 优先用于统计，缺失时使用保守估算。
 - 索引更新改为按路径和内容比较的增量更新，新增、修改和删除文档只更新受影响记录。
 - `accept`、`ignore`、文档草稿生成、文档草稿应用均写入事件日志。
 - 新增 `cyclaw agent runs list` 和 `cyclaw agent runs clean --keep <数量>`，用于读取和清理 Agent 运行记录。

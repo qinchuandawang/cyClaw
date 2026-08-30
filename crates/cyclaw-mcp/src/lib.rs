@@ -16,7 +16,7 @@ use cyclaw_core::{
     get_latest_fact_recovery_report as core_get_latest_fact_recovery,
     get_latest_reconciliation as core_get_latest_reconciliation,
     get_task_context as core_get_task_context, list_document_patches, list_inbox,
-    list_project_facts as core_list_project_facts, list_tasks as core_list_tasks,
+    list_project_facts as core_list_project_facts, list_tasks as core_list_tasks, observer_health,
     preview_fact_patch as preview_fact_patch_core, project_fact_from_input, project_status,
     query_evidence_verifications as core_query_evidence_verifications,
     query_fact_patches as core_query_fact_patches,
@@ -30,7 +30,7 @@ use cyclaw_core::{
 use cyclaw_docs::{DocumentPatchStatus, KnowledgeOperation};
 use cyclaw_events::{ExecutionEventKind, new_execution_event, read_events};
 use cyclaw_knowledge::KnowledgeStatus;
-use cyclaw_model::list_providers;
+use cyclaw_model::{list_providers, read_model_usage};
 use cyclaw_policy::{load_or_default, set_permission};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -187,6 +187,11 @@ impl McpServer {
                 "inputSchema": object_schema(vec![])
             }),
             json!({
+                "name": "get_model_usage",
+                "description": "读取当天模型调用次数、Token 用量和预算相关指标。",
+                "inputSchema": object_schema(vec![])
+            }),
+            json!({
                 "name": "list_events",
                 "description": "读取 cyClaw 事件日志，帮助模型理解知识资产的演进过程。",
                 "inputSchema": object_schema(vec![("limit", json!({ "type": "integer", "minimum": 1, "maximum": 100 }))])
@@ -220,7 +225,8 @@ impl McpServer {
             json!({"name":"doctor","description":"诊断 Git、配置、模型、权限、知识目录和文档写入状态。","inputSchema":object_schema(vec![])}),
             json!({"name":"begin_task","description":"开始一个项目任务，并返回首个带证据的上下文包。","inputSchema":object_schema(vec![("title",json!({"type":"string"})),("objective",json!({"type":"string"})),("related_files",json!({"type":"array","items":{"type":"string"}})),("context_budget_tokens",json!({"type":"integer","minimum":256,"maximum":16000}))])}),
             json!({"name":"get_active_task","description":"读取当前活动任务；没有活动任务时返回 null。","inputSchema":object_schema(vec![])}),
-            json!({"name":"get_task_context","description":"为当前或指定任务编译事实、文档和候选组成的最小上下文包。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("query",json!({"type":"string"})),("budget_tokens",json!({"type":"integer","minimum":256,"maximum":16000})),("limit",json!({"type":"integer","minimum":1,"maximum":50}))])}),
+            json!({"name":"get_task_context","description":"按查询编译项目级最小上下文包；有活动任务时自动结合任务信息，无活动任务也可直接使用。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("query",json!({"type":"string"})),("budget_tokens",json!({"type":"integer","minimum":256,"maximum":16000})),("limit",json!({"type":"integer","minimum":1,"maximum":50}))])}),
+            json!({"name":"get_observer_health","description":"读取独立 Observer 的最近成功时间、错误和状态文件健康状态。","inputSchema":object_schema(vec![])}),
             json!({"name":"record_decision","description":"把任务中的关键决策写入任务记录和结构化 Fact Ledger。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("statement",json!({"type":"string"})),("rationale",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}})),("confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
             json!({"name":"record_failed_approach","description":"记录尝试过但失败的方案、原因和证据，供后续会话避免重复。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("approach",json!({"type":"string"})),("reason",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}}))])}),
             json!({"name":"checkpoint_task","description":"记录长任务检查点、当前结论和相关文件。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("summary",json!({"type":"string"})),("related_files",json!({"type":"array","items":{"type":"string"}}))])}),
@@ -258,6 +264,7 @@ impl McpServer {
                     | "list_document_patches"
                     | "get_policy"
                     | "get_model_providers"
+                    | "get_model_usage"
                     | "list_events"
                     | "list_agent_runs"
                     | "get_candidate_detail"
@@ -265,6 +272,7 @@ impl McpServer {
                     | "list_evidence_verifications"
                     | "list_fact_transactions"
                     | "doctor"
+                    | "get_observer_health"
             );
             if let Some(object) = tool.as_object_mut() {
                 object.insert(
@@ -296,6 +304,7 @@ impl McpServer {
             "list_document_patches" => self.list_document_patches()?,
             "get_policy" => self.get_policy()?,
             "get_model_providers" => self.get_model_providers()?,
+            "get_model_usage" => self.get_model_usage()?,
             "list_events" => self.list_events(arguments)?,
             "list_agent_runs" => self.list_agent_runs(arguments)?,
             "analyze_changes" => self.analyze_changes()?,
@@ -320,6 +329,7 @@ impl McpServer {
             "run_agent" => self.run_agent(arguments)?,
             "set_runtime_strategy" => self.set_runtime_strategy(arguments)?,
             "doctor" => self.doctor()?,
+            "get_observer_health" => json!(observer_health(&self.project_root)?),
             "begin_task" => self.begin_task(arguments)?,
             "get_active_task" => self.get_active_task()?,
             "get_task_context" => self.get_task_context(arguments)?,
@@ -448,6 +458,15 @@ impl McpServer {
             "active_provider": providers.active_provider,
             "providers": providers.providers,
             "source_path": relative_path(&self.project_root, &providers.config_path)
+        }))
+    }
+
+    fn get_model_usage(&self) -> Result<Value> {
+        let policy = load_or_default(&self.project_root)?;
+        Ok(json!({
+            "usage": read_model_usage(&self.project_root),
+            "daily_token_budget": policy.model_policy.daily_token_budget,
+            "source_path": ".cyclaw/model-usage.json"
         }))
     }
 

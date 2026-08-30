@@ -2,7 +2,8 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -18,10 +19,11 @@ use cyclaw_core::{
     generate_document_drafts, generate_inbox, get_active_task, get_latest_reconciliation,
     get_task_context, index_project, init_project, list_document_patches, list_inbox,
     list_project_facts, list_tasks, maintain_project_knowledge, observe_execution_artifacts,
-    observe_project_once, preview_fact_patch, project_fact_from_input, project_status,
-    query_evidence_verifications, query_fact_patches, reconcile_project_knowledge,
-    record_task_decision, record_task_failed_approach, revert_document_patch, revert_fact_patch,
-    scan_project, search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
+    observe_project_once, observer_health, preview_fact_patch, project_fact_from_input,
+    project_status, query_evidence_verifications, query_fact_patches, reconcile_project_knowledge,
+    record_observer_error, record_task_decision, record_task_failed_approach,
+    revert_document_patch, revert_fact_patch, scan_project, search_project, update_inbox_status,
+    verify_fact_evidence, watch_project_once,
 };
 use cyclaw_docs::KnowledgeOperation;
 use cyclaw_knowledge::{KnowledgeImportance, KnowledgeStatus};
@@ -29,7 +31,9 @@ use cyclaw_model::{
     AddProviderOptions, TestProviderOptions, add_provider, list_providers, test_provider,
     use_provider,
 };
-use cyclaw_policy::{PermissionLevel, check_write_path, load_or_default, set_permission};
+use cyclaw_policy::{
+    PermissionLevel, acquire_lock, check_write_path, load_or_default, set_permission,
+};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Parser)]
@@ -556,6 +560,9 @@ enum ObserverCommand {
         /// 项目根目录，默认使用当前目录
         #[arg(short, long)]
         path: Option<PathBuf>,
+        /// 输出机器可读 JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// 安装当前用户的开机登录观察任务（Windows）并立即启动
     Install {
@@ -867,10 +874,32 @@ fn main() -> Result<()> {
                 once,
             } => {
                 let project_root = resolve_path(path)?;
+                let _observer_lock =
+                    acquire_lock(&project_root, "observer", Duration::from_secs(1))?;
                 println!("cyClaw 独立观察器已启动");
                 println!("项目根目录: {}", project_root.display());
                 println!("事件源: 文件系统、Git 快照、测试与构建报告、事实证据");
-                let initial = observe_project_once(&project_root)?;
+                let rescan_required = Arc::new(AtomicBool::new(false));
+                let (sender, receiver) = mpsc::sync_channel(256);
+                let dropped_flag = Arc::clone(&rescan_required);
+                let _watcher = if once {
+                    None
+                } else {
+                    let mut watcher = notify::recommended_watcher(move |event| {
+                        if sender.try_send(event).is_err() {
+                            dropped_flag.store(true, Ordering::Release);
+                        }
+                    })?;
+                    watcher.watch(&project_root, RecursiveMode::Recursive)?;
+                    Some(watcher)
+                };
+                let initial = match observe_project_once(&project_root) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = record_observer_error(&project_root, &error);
+                        return Err(error);
+                    }
+                };
                 print_observer_tick(&initial);
                 if once {
                     return Ok(());
@@ -878,11 +907,6 @@ fn main() -> Result<()> {
 
                 let debounce = Duration::from_millis(debounce_ms.max(100));
                 let maintenance = Duration::from_secs(maintenance_interval_seconds.max(30));
-                let (sender, receiver) = mpsc::sync_channel(256);
-                let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
-                    let _ = sender.try_send(event);
-                })?;
-                watcher.watch(&project_root, RecursiveMode::Recursive)?;
                 loop {
                     match receiver.recv_timeout(maintenance) {
                         Ok(Ok(event)) => {
@@ -895,8 +919,20 @@ fn main() -> Result<()> {
                                 paths.extend(next.paths);
                             }
                             let artifact_events =
-                                observe_execution_artifacts(&project_root, &paths)?;
-                            let tick = observe_project_once(&project_root)?;
+                                match observe_execution_artifacts(&project_root, &paths) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        let _ = record_observer_error(&project_root, &error);
+                                        return Err(error);
+                                    }
+                                };
+                            let tick = match observe_project_once(&project_root) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    let _ = record_observer_error(&project_root, &error);
+                                    return Err(error);
+                                }
+                            };
                             if tick.watch.changed || artifact_events > 0 {
                                 print_observer_tick(&tick);
                                 if artifact_events > 0 {
@@ -906,7 +942,20 @@ fn main() -> Result<()> {
                         }
                         Ok(Err(error)) => eprintln!("文件观察事件异常: {}", error),
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            let (verified, report) = maintain_project_knowledge(&project_root)?;
+                            if rescan_required.swap(false, Ordering::AcqRel)
+                                && let Err(error) = observe_project_once(&project_root)
+                            {
+                                let _ = record_observer_error(&project_root, &error);
+                                return Err(error);
+                            }
+                            let (verified, report) = match maintain_project_knowledge(&project_root)
+                            {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    let _ = record_observer_error(&project_root, &error);
+                                    return Err(error);
+                                }
+                            };
                             println!(
                                 "Observer 周期维护完成: 验证事实 {} 条，重复 {}，冲突 {}，失效 {}，漂移 {}",
                                 verified,
@@ -922,9 +971,16 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            ObserverCommand::Status { path } => {
+            ObserverCommand::Status { path, json } => {
                 let project_root = resolve_path(path)?;
                 let state_path = cyclaw_core::observer_state_path(&project_root);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&observer_health(&project_root)?)?
+                    );
+                    return Ok(());
+                }
                 if !state_path.exists() {
                     println!("Observer 尚未在此项目运行");
                 } else {
@@ -1824,7 +1880,7 @@ fn install_observer_task(project_root: &Path) -> Result<()> {
         }
         println!("已安装并启动独立 Observer: {}", task_name);
         println!("项目: {}", project_root.display());
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -1849,7 +1905,7 @@ fn uninstall_observer_task(project_root: &Path) -> Result<()> {
             );
         }
         println!("已卸载独立 Observer: {}", task_name);
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(windows))]
     {

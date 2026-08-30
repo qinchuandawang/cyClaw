@@ -222,6 +222,11 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
                         serde_json::json!({
                             "provider": provider_name.clone(),
                             "model_response_chars": result.response.chars().count(),
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_tokens,
+                            "total_tokens": result.total_tokens,
+                            "latency_millis": result.latency_millis,
+                            "cache_hit": result.cache_hit,
                         }),
                     ),
                 )?;
@@ -231,6 +236,14 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
                 match review_result {
                     Ok(response) => {
                         for review in response.reviews {
+                            if !pending_candidates
+                                .iter()
+                                .any(|candidate| candidate.id == review.candidate_id)
+                            {
+                                review_error =
+                                    Some(format!("模型返回未知候选: {}", review.candidate_id));
+                                break;
+                            }
                             if update_candidate_review(
                                 options.project_root.clone(),
                                 &review.candidate_id,

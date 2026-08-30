@@ -50,11 +50,14 @@ use cyclaw_memory::{
     revert_fact_patch as memory_revert_fact_patch, set_task_phase as memory_set_task_phase,
     verify_fact_evidence as memory_verify_fact_evidence,
 };
-use cyclaw_policy::{PermissionLevel, acquire_lock, check_write_path, load_or_default};
+use cyclaw_policy::{
+    PermissionLevel, acquire_lock, check_write_path, load_or_default, lock_exists,
+};
 use cyclaw_retrieval::{IndexSummary, SearchResult, build_index, search_index};
 use cyclaw_scanner::{ProjectProfile, scan_project_profile};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tempfile::NamedTempFile;
 
 const CYCLE_DIR: &str = ".cyclaw";
 
@@ -159,6 +162,10 @@ pub struct ObserverState {
     pub updated_at: String,
     pub last_snapshot: Option<GitChangeSnapshot>,
     pub last_reconciled_at: Option<String>,
+    #[serde(default)]
+    pub last_success_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +177,17 @@ pub struct ObserverTick {
     pub verified_facts: usize,
     pub reconciliation: Option<ReconciliationReport>,
     pub state_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserverHealth {
+    pub state_path: PathBuf,
+    pub state_exists: bool,
+    pub healthy: bool,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_updated_at: String,
+    pub running: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -311,7 +329,7 @@ pub struct SearchOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskContextPack {
-    pub task: TaskRecord,
+    pub task: Option<TaskRecord>,
     pub query: String,
     pub facts: FactContext,
     pub documents: Vec<SearchResult>,
@@ -1163,17 +1181,25 @@ pub fn get_task_context(
     limit: usize,
 ) -> Result<TaskContextPack> {
     let task = match task_id {
-        Some(id) => memory_get_task(project_root, id)?,
-        None => {
-            memory_active_task(project_root)?.context("当前没有活动任务，请先调用 begin_task")?
-        }
+        Some(id) => Some(memory_get_task(project_root, id)?),
+        None => memory_active_task(project_root)?,
     };
-    let query = query
-        .filter(|value| !value.trim().is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("{} {}", task.title, task.objective));
+    let explicit_query = query.filter(|value| !value.trim().is_empty());
+    let query = explicit_query.map(ToString::to_string).unwrap_or_else(|| {
+        task.as_ref()
+            .map(|task| {
+                format!(
+                    "{} {} {}",
+                    task.title,
+                    task.objective,
+                    task.related_files.join(" ")
+                )
+            })
+            .unwrap_or_default()
+    });
     let budget = budget_tokens
-        .unwrap_or(task.context_budget_tokens)
+        .or_else(|| task.as_ref().map(|task| task.context_budget_tokens))
+        .unwrap_or(2_000)
         .clamp(256, 16_000);
     let fact_budget = (budget * 60 / 100).max(128);
     let facts = compile_fact_context(project_root, &query, fact_budget, limit)?;
@@ -1208,15 +1234,41 @@ pub fn get_task_context(
             )
         })
         .collect::<Vec<_>>();
+    if task.is_none() && explicit_query.is_some() {
+        let query_terms = query
+            .split_whitespace()
+            .map(|value| value.to_lowercase())
+            .collect::<Vec<_>>();
+        candidates.retain(|candidate| {
+            query_terms.iter().any(|term| {
+                candidate.summary.to_lowercase().contains(term)
+                    || candidate
+                        .related_files
+                        .iter()
+                        .any(|path| path.to_lowercase().contains(term))
+                    || candidate
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.to_lowercase().contains(term))
+            })
+        });
+    } else if task.is_none() && explicit_query.is_none() {
+        candidates.clear();
+    }
     candidates.sort_by_key(|item| std::cmp::Reverse(item.confidence));
-    let related = task.related_files.iter().collect::<HashSet<_>>();
+    let related = task
+        .as_ref()
+        .map(|task| task.related_files.iter().collect::<HashSet<_>>())
+        .unwrap_or_default();
     candidates.sort_by_key(|candidate| {
         let directly_related = candidate
             .related_files
             .iter()
             .any(|path| related.contains(path));
-        let failure_priority = matches!(task.phase, TaskPhase::Investigate | TaskPhase::Verify)
-            && candidate.source_type == KnowledgeSourceType::ExecutionFailure;
+        let failure_priority = matches!(
+            task.as_ref().map(|task| &task.phase),
+            Some(TaskPhase::Investigate) | Some(TaskPhase::Verify)
+        ) && candidate.source_type == KnowledgeSourceType::ExecutionFailure;
         (
             !failure_priority,
             !directly_related,
@@ -1241,18 +1293,24 @@ pub fn get_task_context(
     });
 
     let selection_reason = format!(
-        "任务阶段 {:?}：{}",
-        task.phase,
-        match task.phase {
-            TaskPhase::Investigate => "优先失败事件与证据",
-            TaskPhase::Design => "优先约束、架构与相关事实",
-            TaskPhase::Implement => "优先相关文件和待处理候选",
-            TaskPhase::Verify => "优先失败事件、检查点与验证线索",
-            TaskPhase::Handoff => "优先阶段摘要和已验证事实",
+        "{}：{}",
+        task.as_ref()
+            .map(|task| format!("任务阶段 {:?}", task.phase))
+            .unwrap_or_else(|| "项目级上下文".to_string()),
+        match task.as_ref().map(|task| &task.phase) {
+            Some(TaskPhase::Investigate) => "优先失败事件与证据",
+            Some(TaskPhase::Design) => "优先约束、架构与相关事实",
+            Some(TaskPhase::Implement) => "优先相关文件和待处理候选",
+            Some(TaskPhase::Verify) => "优先失败事件、检查点与验证线索",
+            Some(TaskPhase::Handoff) => "优先阶段摘要和已验证事实",
+            None => "优先项目画像、当前事实和相关文档",
         }
     );
     Ok(TaskContextPack {
-        related_files: task.related_files.clone(),
+        related_files: task
+            .as_ref()
+            .map(|task| task.related_files.clone())
+            .unwrap_or_default(),
         task,
         query,
         facts,
@@ -1399,6 +1457,8 @@ pub fn observe_project_once(project_root: &Path) -> Result<ObserverTick> {
         updated_at: Utc::now().to_rfc3339(),
         last_snapshot: None,
         last_reconciled_at: None,
+        last_success_at: None,
+        last_error: None,
     });
     let watch = watch_project_once(project_root, state.last_snapshot.as_ref())?;
     let indexed = if watch.changed || !index_path(project_root).exists() {
@@ -1422,6 +1482,8 @@ pub fn observe_project_once(project_root: &Path) -> Result<ObserverTick> {
     };
     state.last_snapshot = Some(current_change_snapshot(project_root)?);
     state.updated_at = Utc::now().to_rfc3339();
+    state.last_success_at = Some(state.updated_at.clone());
+    state.last_error = None;
     write_observer_state(&state_path, &state)?;
     record_event(
         project_root,
@@ -1447,6 +1509,16 @@ pub fn observe_project_once(project_root: &Path) -> Result<ObserverTick> {
         reconciliation,
         state_path,
     })
+}
+
+pub fn record_observer_error(project_root: &Path, error: &anyhow::Error) -> Result<()> {
+    let state_path = observer_state_path(project_root);
+    let Some(mut state) = read_observer_state(project_root)? else {
+        return Ok(());
+    };
+    state.updated_at = Utc::now().to_rfc3339();
+    state.last_error = Some(error.to_string());
+    write_observer_state(&state_path, &state)
 }
 
 /// 在没有新文件事件时执行低频维护，防止事实证据和知识关系长期漂移。
@@ -1484,6 +1556,42 @@ pub fn observer_state_path(project_root: &Path) -> PathBuf {
     project_root.join(CYCLE_DIR).join("observer-state.json")
 }
 
+pub fn observer_health(project_root: &Path) -> Result<ObserverHealth> {
+    let state_path = observer_state_path(project_root);
+    let Some(state) = read_observer_state(project_root)? else {
+        return Ok(ObserverHealth {
+            state_path,
+            state_exists: false,
+            healthy: false,
+            last_success_at: None,
+            last_error: None,
+            last_updated_at: String::new(),
+            running: false,
+        });
+    };
+    let running = lock_exists(project_root, "observer");
+    let fresh = state.last_success_at.as_deref().is_some_and(|value| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .is_some_and(|time| {
+                Utc::now()
+                    .signed_duration_since(time.with_timezone(&Utc))
+                    .num_seconds()
+                    < 900
+            })
+    });
+    let healthy = fresh && state.last_error.is_none();
+    Ok(ObserverHealth {
+        state_path,
+        state_exists: true,
+        healthy,
+        last_success_at: state.last_success_at,
+        last_error: state.last_error,
+        last_updated_at: state.updated_at,
+        running,
+    })
+}
+
 fn read_observer_state(project_root: &Path) -> Result<Option<ObserverState>> {
     let path = observer_state_path(project_root);
     if !path.exists() {
@@ -1496,7 +1604,11 @@ fn write_observer_state(path: &Path, state: &ObserverState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(state)?)?;
+    let parent = path.parent().context("Observer 状态文件缺少父目录")?;
+    let mut temp = NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temp, state)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| anyhow::anyhow!(error))?;
     Ok(())
 }
 
@@ -1544,7 +1656,7 @@ fn suggested_next_steps(status: &ProjectStatus) -> Vec<String> {
     }
 
     if status.git_has_changes {
-        steps.push("运行 `cyclaw watch --once` 自动分析当前变更".to_string());
+        steps.push("运行 `cyclaw observer run --once` 自动分析当前变更".to_string());
     }
 
     if status.inbox_pending > 0 {
@@ -1943,6 +2055,24 @@ mod tests {
 
         let second = observe_project_once(temp.path()).unwrap();
         assert!(!second.watch.changed);
+        let health = observer_health(temp.path()).unwrap();
+        assert!(health.healthy);
+        assert!(health.last_success_at.is_some());
+    }
+
+    #[test]
+    fn project_context_does_not_require_active_task() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        run_git(temp.path(), &["config", "user.name", "Test User"]);
+        init_project(InitOptions::new(temp.path().to_path_buf())).unwrap();
+        scan_project(ScanOptions::new(temp.path().to_path_buf())).unwrap();
+
+        let context = get_task_context(temp.path(), None, Some("项目架构"), None, 10).unwrap();
+        assert!(context.task.is_none());
+        assert_eq!(context.query, "项目架构");
+        assert!(context.budget_tokens >= 256);
     }
 
     #[test]

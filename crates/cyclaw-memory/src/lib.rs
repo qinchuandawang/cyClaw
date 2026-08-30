@@ -55,20 +55,15 @@ pub struct TaskCheckpoint {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPhase {
+    #[default]
     Investigate,
     Design,
     Implement,
     Verify,
     Handoff,
-}
-
-impl Default for TaskPhase {
-    fn default() -> Self {
-        Self::Investigate
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1742,7 +1737,10 @@ pub fn compile_fact_context(
         .into_iter()
         .filter(|fact| fact.status == FactStatus::Active)
         .filter_map(|fact| {
-            let fact_tokens = tokens(&fact.statement);
+            let mut fact_tokens = tokens(&fact.statement);
+            for evidence in &fact.evidence {
+                fact_tokens.extend(tokens(evidence));
+            }
             let overlap = query_tokens.intersection(&fact_tokens).count() as u32;
             let exact = if !query.trim().is_empty()
                 && fact
@@ -2351,7 +2349,7 @@ fn push_task_activity(task: &mut TaskRecord, kind: &str, summary: String, create
         if task.phase_summary.is_empty() {
             task.phase_summary = item;
         } else {
-            task.phase_summary.push_str("；");
+            task.phase_summary.push('；');
             task.phase_summary.push_str(&item);
         }
         const SUMMARY_LIMIT: usize = 4_000;

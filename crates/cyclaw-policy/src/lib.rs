@@ -32,11 +32,19 @@ pub fn acquire_lock(project_root: &Path, name: &str, timeout: Duration) -> Resul
 
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(_) => return Ok(ProjectLock { path }),
+            Ok(mut file) => {
+                use std::io::Write;
+                writeln!(file, "{}", std::process::id())?;
+                return Ok(ProjectLock { path });
+            }
             Err(error)
                 if error.kind() == ErrorKind::AlreadyExists
                     || (error.kind() == ErrorKind::PermissionDenied && path.exists()) =>
             {
+                if lock_is_stale(&path) {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
                 // Windows 可能将已存在锁文件的 create_new 竞争报告为 PermissionDenied。
                 if Instant::now() >= deadline {
                     anyhow::bail!("获取项目锁超时: {}", path.display());
@@ -47,6 +55,54 @@ pub fn acquire_lock(project_root: &Path, name: &str, timeout: Duration) -> Resul
                 return Err(error).with_context(|| format!("无法创建项目锁: {}", path.display()));
             }
         }
+    }
+}
+
+pub fn lock_exists(project_root: &Path, name: &str) -> bool {
+    let path = project_root
+        .join(CYCLE_DIR)
+        .join(LOCK_DIR)
+        .join(format!("{}.lock", sanitize_lock_name(name)));
+    path.exists() && !lock_is_stale(&path)
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return true;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    !process_is_running(pid)
+}
+
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {}", pid);
+        std::process::Command::new("tasklist")
+            .args(["/FI", &filter, "/NH"])
+            .output()
+            .ok()
+            .is_some_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+    }
+    #[cfg(unix)]
+    {
+        return std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -102,6 +158,24 @@ pub struct ModelPolicy {
     pub request_timeout_seconds: u64,
     pub max_retries: usize,
     pub min_interval_millis: u64,
+    #[serde(default)]
+    pub cache_model_responses: bool,
+    #[serde(default = "default_model_input_tokens")]
+    pub max_input_tokens: usize,
+    #[serde(default = "default_model_output_tokens")]
+    pub max_output_tokens: usize,
+    #[serde(default = "default_daily_model_tokens")]
+    pub daily_token_budget: usize,
+}
+
+fn default_model_input_tokens() -> usize {
+    12000
+}
+fn default_model_output_tokens() -> usize {
+    512
+}
+fn default_daily_model_tokens() -> usize {
+    100000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,6 +325,10 @@ pub fn default_policy() -> PolicyConfig {
             request_timeout_seconds: 30,
             max_retries: 2,
             min_interval_millis: 100,
+            cache_model_responses: false,
+            max_input_tokens: default_model_input_tokens(),
+            max_output_tokens: default_model_output_tokens(),
+            daily_token_budget: default_daily_model_tokens(),
         },
         automation: AutomationPolicy {},
     }
@@ -335,6 +413,30 @@ fn policy_from_yaml(value: serde_yaml::Value) -> PolicyConfig {
             .and_then(|value| value.as_u64())
         {
             policy.model_policy.min_interval_millis = value;
+        }
+        if let Some(value) = model_policy
+            .get("cache_model_responses")
+            .and_then(|value| value.as_bool())
+        {
+            policy.model_policy.cache_model_responses = value;
+        }
+        if let Some(value) = model_policy
+            .get("max_input_tokens")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.max_input_tokens = value.max(256) as usize;
+        }
+        if let Some(value) = model_policy
+            .get("max_output_tokens")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.max_output_tokens = value.max(64) as usize;
+        }
+        if let Some(value) = model_policy
+            .get("daily_token_budget")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.daily_token_budget = value.max(1) as usize;
         }
     }
     policy

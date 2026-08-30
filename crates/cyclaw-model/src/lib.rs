@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use cyclaw_policy::{PermissionLevel, acquire_lock, check_model_call, load_or_default};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tempfile::NamedTempFile;
 
 const CYCLE_DIR: &str = ".cyclaw";
 const MODEL_CONFIG_FILE: &str = "model-providers.yaml";
@@ -72,6 +73,20 @@ pub struct TestProviderResult {
     pub provider_name: String,
     pub model: String,
     pub response: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
+    pub latency_millis: u128,
+    pub cache_hit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelUsage {
+    pub date: String,
+    pub calls: usize,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,13 +174,30 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
         options.prompt.clone()
     };
     let cache_key = cache_key(&options.name, provider, &prompt);
-    if let Some(response) = read_cached_response(&options.project_root, &cache_key)? {
+    if policy.model_policy.cache_model_responses
+        && let Some(response) = read_cached_response(&options.project_root, &cache_key)?
+    {
         return Ok(TestProviderResult {
             provider_name: options.name,
             model: provider.model.clone(),
             response,
+            input_tokens: estimate_tokens(&prompt),
+            output_tokens: 0,
+            total_tokens: estimate_tokens(&prompt),
+            latency_millis: 0,
+            cache_hit: true,
         });
     }
+
+    let estimated_input = estimate_tokens(&prompt);
+    if estimated_input > policy.model_policy.max_input_tokens {
+        anyhow::bail!(
+            "模型输入超过上限: {} > {} tokens",
+            estimated_input,
+            policy.model_policy.max_input_tokens
+        );
+    }
+    reserve_daily_budget(&options.project_root, &policy, estimated_input)?;
 
     let api_key = std::env::var(&provider.api_key_env)
         .with_context(|| format!("环境变量未设置: {}", provider.api_key_env))?;
@@ -173,19 +205,42 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
         &options.project_root,
         policy.model_policy.min_interval_millis,
     )?;
-    let response = test_openai_compatible(
+    let started = Instant::now();
+    let completion = test_openai_compatible(
         provider,
         &api_key,
         &prompt,
         Duration::from_secs(policy.model_policy.request_timeout_seconds.max(1)),
         policy.model_policy.max_retries,
+        policy.model_policy.max_output_tokens,
     )?;
-    write_cached_response(&options.project_root, &cache_key, &response)?;
+    let latency_millis = started.elapsed().as_millis();
+    let input_tokens = completion.input_tokens.unwrap_or(estimated_input);
+    let output_tokens = completion
+        .output_tokens
+        .unwrap_or_else(|| estimate_tokens(&completion.response));
+    let total_tokens = completion
+        .total_tokens
+        .unwrap_or(input_tokens.saturating_add(output_tokens));
+    record_usage(
+        &options.project_root,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    )?;
+    if policy.model_policy.cache_model_responses {
+        write_cached_response(&options.project_root, &cache_key, &completion.response)?;
+    }
 
     Ok(TestProviderResult {
         provider_name: options.name,
         model: provider.model.clone(),
-        response,
+        response: completion.response,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        latency_millis,
+        cache_hit: false,
     })
 }
 
@@ -246,8 +301,14 @@ fn write_cached_response(project_root: &Path, key: &str, response: &str) -> Resu
         let keep_from = entries.len() - MAX_ENTRIES;
         entries.drain(0..keep_from);
     }
-    fs::write(&path, serde_json::to_string_pretty(&entries)?)
-        .with_context(|| format!("无法写入模型缓存: {}", path.display()))
+    let parent = path.parent().context("模型缓存缺少父目录")?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, &entries)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("无法原子替换模型缓存: {}", path.display()))
         .map(|_| ())
 }
 
@@ -341,13 +402,21 @@ fn redact_sensitive_text(input: &str) -> String {
         .join("\n")
 }
 
+struct CompletionResult {
+    response: String,
+    input_tokens: Option<usize>,
+    output_tokens: Option<usize>,
+    total_tokens: Option<usize>,
+}
+
 fn test_openai_compatible(
     provider: &ModelProviderConfig,
     api_key: &str,
     prompt: &str,
     timeout: Duration,
     max_retries: usize,
-) -> Result<String> {
+    max_output_tokens: usize,
+) -> Result<CompletionResult> {
     let endpoint = format!(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
@@ -368,7 +437,7 @@ fn test_openai_compatible(
             }
         ],
         "temperature": 0,
-        "max_tokens": 512,
+        "max_tokens": max_output_tokens,
         "thinking": {
             "type": if provider.thinking_enabled { "enabled" } else { "disabled" }
         }
@@ -408,7 +477,7 @@ fn test_openai_compatible(
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("message"));
 
-    message
+    let content = message
         .and_then(|message| message.get("content"))
         .and_then(|content| content.as_str())
         .or_else(|| {
@@ -419,7 +488,92 @@ fn test_openai_compatible(
         .map(str::trim)
         .filter(|content| !content.is_empty())
         .map(ToString::to_string)
-        .with_context(|| format!("模型响应缺少 choices[0].message.content: {}", value))
+        .with_context(|| format!("模型响应缺少 choices[0].message.content: {}", value))?;
+    let usage = value.get("usage");
+    Ok(CompletionResult {
+        response: content,
+        input_tokens: usage
+            .and_then(|v| v.get("prompt_tokens").and_then(|n| n.as_u64()))
+            .map(|n| n as usize),
+        output_tokens: usage
+            .and_then(|v| v.get("completion_tokens").and_then(|n| n.as_u64()))
+            .map(|n| n as usize),
+        total_tokens: usage
+            .and_then(|v| v.get("total_tokens").and_then(|n| n.as_u64()))
+            .map(|n| n as usize),
+    })
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4).max(1)
+}
+
+fn usage_path(project_root: &Path) -> PathBuf {
+    project_root.join(CYCLE_DIR).join("model-usage.json")
+}
+
+fn read_usage(project_root: &Path) -> ModelUsage {
+    fs::read_to_string(usage_path(project_root))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .filter(|usage: &ModelUsage| {
+            usage.date == chrono::Utc::now().format("%Y-%m-%d").to_string()
+        })
+        .unwrap_or_else(|| ModelUsage {
+            date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        })
+}
+
+pub fn read_model_usage(project_root: &Path) -> ModelUsage {
+    read_usage(project_root)
+}
+
+fn reserve_daily_budget(
+    project_root: &Path,
+    policy: &cyclaw_policy::PolicyConfig,
+    estimated_input: usize,
+) -> Result<()> {
+    let _lock = acquire_lock(project_root, "model-usage", Duration::from_secs(5))?;
+    let usage = read_usage(project_root);
+    let projected = usage
+        .total_tokens
+        .saturating_add(estimated_input)
+        .saturating_add(policy.model_policy.max_output_tokens);
+    if projected > policy.model_policy.daily_token_budget {
+        anyhow::bail!(
+            "模型日预算不足: 预计 {} tokens，预算 {} tokens",
+            projected,
+            policy.model_policy.daily_token_budget
+        );
+    }
+    Ok(())
+}
+
+fn record_usage(
+    project_root: &Path,
+    input_tokens: usize,
+    output_tokens: usize,
+    total_tokens: usize,
+) -> Result<()> {
+    let _lock = acquire_lock(project_root, "model-usage", Duration::from_secs(5))?;
+    let mut usage = read_usage(project_root);
+    usage.calls = usage.calls.saturating_add(1);
+    usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
+    usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+    usage.total_tokens = usage.total_tokens.saturating_add(total_tokens);
+    let path = usage_path(project_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut temporary = NamedTempFile::new_in(path.parent().unwrap())?;
+    serde_json::to_writer_pretty(&mut temporary, &usage)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn acquire_model_slot(
@@ -531,5 +685,22 @@ mod tests {
                 .active_provider,
             Some("second".to_string())
         );
+    }
+
+    #[test]
+    fn estimates_tokens_with_a_conservative_lower_bound() {
+        assert_eq!(estimate_tokens(""), 1);
+        assert_eq!(estimate_tokens("12345678"), 2);
+    }
+
+    #[test]
+    fn persists_daily_model_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        record_usage(temp.path(), 10, 5, 15).unwrap();
+        let usage = read_model_usage(temp.path());
+        assert_eq!(usage.calls, 1);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
     }
 }

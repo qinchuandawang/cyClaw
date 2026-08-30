@@ -20,8 +20,8 @@
 - 候选显示规则或模型置信度；模型审查结果会写回候选详情。
 - 支持批量接受置信度不低于 80 的候选，以及批量忽略低于 60 或模型建议忽略的候选。
 - 读取 `get_project_status`、`list_pending_knowledge`、`list_document_patches`。
-- 执行 `cyclaw init`、`cyclaw scan`、`cyclaw watch --once`。
-- 启动或停止 `cyclaw watch` 常驻进程。
+- 执行 `cyclaw init`、`cyclaw scan`、`cyclaw observer run --once`。
+- 启动或停止 `cyclaw observer run` 常驻进程。
 - Watch 使用操作系统文件事件唤醒，再通过 Git 内容快照去重；空闲时不轮询、不打印日志。
 - Output 面板默认不自动弹出，可通过“查看运行日志”按需打开。
 - 未受信任的 VS Code 工作区不会自动初始化项目、启动 Watch、调用 MCP 或执行 CLI。

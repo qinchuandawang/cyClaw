@@ -7,8 +7,8 @@
 - 提供 `cyClaw` Tool Window。
 - 展示项目状态、待处理候选知识、待应用文档草稿。
 - 通过 `cyclaw mcp` 读取 `get_project_status`、`list_pending_knowledge`、`list_document_patches`。
-- 通过 CLI 执行 `init`、`scan`、`watch --once`。
-- 支持启动和停止 `cyclaw watch` 常驻监听。
+- 通过 CLI 执行 `init`、`scan`、`observer run --once`。
+- 支持启动和停止 `cyclaw observer run` 常驻监听。
 - 支持接受、忽略候选知识。
 - 支持应用文档草稿，应用前会弹出确认框。
 

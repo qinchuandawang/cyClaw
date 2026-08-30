@@ -1,4 +1,5 @@
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,11 +117,11 @@ pub fn read_execution_events(project_root: &Path) -> Result<Vec<ExecutionEvent>>
         return Ok(Vec::new());
     }
     let content = fs::read_to_string(path)?;
-    content
+    Ok(content
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| Ok(serde_json::from_str(line)?))
-        .collect()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect::<Vec<ExecutionEvent>>())
 }
 
 pub fn new_execution_event(
@@ -137,11 +138,12 @@ pub fn new_execution_event(
     ExecutionEvent {
         schema_version: 1,
         idempotency_key: format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{:016x}",
             kind_name(&kind),
             command_summary,
             exit_code.unwrap_or_default(),
-            timed_out
+            timed_out,
+            execution_digest(&related_files, error_summary.as_deref()),
         ),
         id,
         created_at: Utc::now().to_rfc3339(),
@@ -153,6 +155,13 @@ pub fn new_execution_event(
         related_files,
         error_summary,
     }
+}
+
+fn execution_digest(related_files: &[String], error_summary: Option<&str>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    related_files.hash(&mut hasher);
+    error_summary.unwrap_or_default().hash(&mut hasher);
+    hasher.finish()
 }
 
 fn kind_name(kind: &ExecutionEventKind) -> &'static str {
@@ -195,7 +204,9 @@ pub fn read_events(project_root: &Path) -> Result<Vec<AgentEvent>> {
         .with_context(|| format!("无法读取事件日志: {}", path.display()))?;
     let mut events = Vec::new();
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        events.push(serde_json::from_str(line)?);
+        if let Ok(event) = serde_json::from_str(line) {
+            events.push(event);
+        }
     }
     Ok(events)
 }
