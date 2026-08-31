@@ -10,6 +10,7 @@ use cyclaw_docs::DocumentPatchStatus;
 use cyclaw_events::{AgentEventType, append_event, new_event, new_id};
 use cyclaw_knowledge::KnowledgeStatus;
 use cyclaw_model::{TestProviderOptions, list_providers, test_provider};
+use cyclaw_policy::acquire_lock;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +137,11 @@ pub fn cleanup_agent_runs(project_root: &Path, keep: usize) -> Result<usize> {
 
 pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
     ensure_directory(&options.project_root)?;
+    let _run_lock = acquire_lock(
+        &options.project_root,
+        "agent-run",
+        std::time::Duration::from_secs(5),
+    )?;
     let started_at = Utc::now();
     let state_path = run_state_path(&options.project_root);
     let previous_state = read_run_state(&state_path)?;

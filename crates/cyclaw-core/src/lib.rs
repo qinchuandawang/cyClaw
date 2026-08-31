@@ -47,9 +47,12 @@ use cyclaw_memory::{
     query_evidence_verifications as memory_query_evidence_verifications,
     query_fact_patches as memory_query_fact_patches,
     reconcile_knowledge as memory_reconcile_knowledge, record_decision as memory_record_decision,
+    record_decision_for_session as memory_record_decision_for_session,
     record_failed_approach as memory_record_failed_approach,
+    record_failed_approach_for_session as memory_record_failed_approach_for_session,
     recover_fact_patch_transactions as memory_recover_fact_patch_transactions,
     revert_fact_patch as memory_revert_fact_patch, set_task_phase as memory_set_task_phase,
+    set_task_phase_for_session as memory_set_task_phase_for_session,
     verify_fact_evidence as memory_verify_fact_evidence,
 };
 use cyclaw_policy::{
@@ -1197,6 +1200,15 @@ pub fn set_task_phase(
     memory_set_task_phase(project_root, task_id, phase)
 }
 
+pub fn set_task_phase_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    phase: TaskPhase,
+    session_id: Option<&str>,
+) -> Result<TaskRecord> {
+    memory_set_task_phase_for_session(project_root, task_id, phase, session_id)
+}
+
 pub fn get_task_context(
     project_root: &Path,
     task_id: Option<&str>,
@@ -1383,6 +1395,26 @@ pub fn record_task_decision(
     )
 }
 
+pub fn record_task_decision_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    statement: String,
+    rationale: String,
+    evidence: Vec<String>,
+    confidence: u8,
+    session_id: Option<&str>,
+) -> Result<(TaskRecord, ProjectFact)> {
+    memory_record_decision_for_session(
+        project_root,
+        task_id,
+        statement,
+        rationale,
+        evidence,
+        confidence,
+        session_id,
+    )
+}
+
 pub fn record_task_failed_approach(
     project_root: &Path,
     task_id: Option<&str>,
@@ -1391,6 +1423,24 @@ pub fn record_task_failed_approach(
     evidence: Vec<String>,
 ) -> Result<(TaskRecord, ProjectFact)> {
     memory_record_failed_approach(project_root, task_id, approach, reason, evidence)
+}
+
+pub fn record_task_failed_approach_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    approach: String,
+    reason: String,
+    evidence: Vec<String>,
+    session_id: Option<&str>,
+) -> Result<(TaskRecord, ProjectFact)> {
+    memory_record_failed_approach_for_session(
+        project_root,
+        task_id,
+        approach,
+        reason,
+        evidence,
+        session_id,
+    )
 }
 
 pub fn checkpoint_task(
@@ -1687,7 +1737,9 @@ pub fn record_observer_metrics(
     coalesced: u64,
     dropped: u64,
     compensating: u64,
+    analyses: u64,
 ) -> Result<()> {
+    let _lock = acquire_lock(project_root, "observer-metrics", Duration::from_secs(5))?;
     let state_path = observer_state_path(project_root);
     let Some(mut state) = read_observer_state(project_root)? else {
         return Ok(());
@@ -1696,9 +1748,7 @@ pub fn record_observer_metrics(
     state.events_coalesced = state.events_coalesced.saturating_add(coalesced);
     state.events_dropped = state.events_dropped.saturating_add(dropped);
     state.compensating_scans = state.compensating_scans.saturating_add(compensating);
-    state.analysis_count = state
-        .analysis_count
-        .saturating_add(received.saturating_sub(coalesced));
+    state.analysis_count = state.analysis_count.saturating_add(analyses);
     state.updated_at = Utc::now().to_rfc3339();
     write_observer_state(&state_path, &state)
 }

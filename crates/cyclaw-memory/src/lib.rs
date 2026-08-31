@@ -626,10 +626,20 @@ pub fn set_task_phase(
     task_id: Option<&str>,
     phase: TaskPhase,
 ) -> Result<TaskRecord> {
+    set_task_phase_for_session(project_root, task_id, phase, None)
+}
+
+pub fn set_task_phase_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    phase: TaskPhase,
+    session_id: Option<&str>,
+) -> Result<TaskRecord> {
     ensure_memory_dirs(project_root)?;
     let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
-    let id = resolve_task_id(project_root, task_id)?;
+    let id = resolve_task_id_for_session(project_root, task_id, session_id)?;
     let mut task = read_task(project_root, &id)?;
+    ensure_task_session(&task, session_id)?;
     ensure_active(&task)?;
     task.phase = phase;
     let now = Utc::now().to_rfc3339();
@@ -664,10 +674,31 @@ pub fn record_decision(
     evidence: Vec<String>,
     confidence: u8,
 ) -> Result<(TaskRecord, ProjectFact)> {
+    record_decision_for_session(
+        project_root,
+        task_id,
+        statement,
+        rationale,
+        evidence,
+        confidence,
+        None,
+    )
+}
+
+pub fn record_decision_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    statement: String,
+    rationale: String,
+    evidence: Vec<String>,
+    confidence: u8,
+    session_id: Option<&str>,
+) -> Result<(TaskRecord, ProjectFact)> {
     ensure_memory_dirs(project_root)?;
     let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
-    let id = resolve_task_id(project_root, task_id)?;
+    let id = resolve_task_id_for_session(project_root, task_id, session_id)?;
     let mut task = read_task(project_root, &id)?;
+    ensure_task_session(&task, session_id)?;
     ensure_active(&task)?;
     let now = Utc::now().to_rfc3339();
     let decision = TaskDecision {
@@ -722,10 +753,22 @@ pub fn record_failed_approach(
     reason: String,
     evidence: Vec<String>,
 ) -> Result<(TaskRecord, ProjectFact)> {
+    record_failed_approach_for_session(project_root, task_id, approach, reason, evidence, None)
+}
+
+pub fn record_failed_approach_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    approach: String,
+    reason: String,
+    evidence: Vec<String>,
+    session_id: Option<&str>,
+) -> Result<(TaskRecord, ProjectFact)> {
     ensure_memory_dirs(project_root)?;
     let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
-    let id = resolve_task_id(project_root, task_id)?;
+    let id = resolve_task_id_for_session(project_root, task_id, session_id)?;
     let mut task = read_task(project_root, &id)?;
+    ensure_task_session(&task, session_id)?;
     ensure_active(&task)?;
     let now = Utc::now().to_rfc3339();
     let statement = format!("失败方案：{}；原因：{}", approach, reason);
@@ -2368,10 +2411,6 @@ fn finding(
         recommended_operation: operation.to_string(),
         confidence,
     }
-}
-
-fn resolve_task_id(project_root: &Path, task_id: Option<&str>) -> Result<String> {
-    resolve_task_id_for_session(project_root, task_id, None)
 }
 
 fn resolve_task_id_for_session(

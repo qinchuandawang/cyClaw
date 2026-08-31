@@ -13,7 +13,6 @@ use cyclaw_core::{
     checkpoint_task_for_session as checkpoint_project_task_for_session,
     close_task_for_session as close_project_task_for_session,
     diagnose_fact_patch_transactions as core_diagnose_fact_transactions, generate_document_drafts,
-    get_active_task as core_get_active_task,
     get_active_task_for_session as core_get_active_task_for_session,
     get_latest_fact_recovery_report as core_get_latest_fact_recovery,
     get_latest_reconciliation as core_get_latest_reconciliation,
@@ -23,11 +22,11 @@ use cyclaw_core::{
     project_status, query_evidence_verifications as core_query_evidence_verifications,
     query_fact_patches as core_query_fact_patches,
     reconcile_project_knowledge as core_reconcile_project_knowledge, record_execution_event,
-    record_task_decision, record_task_failed_approach,
+    record_task_decision_for_session, record_task_failed_approach_for_session,
     recover_fact_patch_transactions as recover_fact_transactions,
     revert_document_patch as revert_patch, revert_fact_patch as revert_fact_patch_core,
-    search_project, set_task_phase as set_project_task_phase, update_inbox_status,
-    verify_fact_evidence as verify_fact_evidence_core, watch_project_once,
+    search_project, set_task_phase_for_session as set_project_task_phase_for_session,
+    update_inbox_status, verify_fact_evidence as verify_fact_evidence_core, watch_project_once,
 };
 use cyclaw_docs::{DocumentPatchStatus, KnowledgeOperation};
 use cyclaw_events::{ExecutionEventKind, new_execution_event, read_events};
@@ -229,11 +228,11 @@ impl McpServer {
             json!({"name":"get_active_task","description":"按 session 读取当前活动任务；没有活动任务时返回 null。","inputSchema":object_schema(vec![("session_id",json!({"type":"string","maxLength":128}))])}),
             json!({"name":"get_task_context","description":"按 session、查询和预算编译项目级最小上下文包。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("session_id",json!({"type":"string","maxLength":128})),("query",json!({"type":"string"})),("budget_tokens",json!({"type":"integer","minimum":256,"maximum":16000})),("limit",json!({"type":"integer","minimum":1,"maximum":50}))])}),
             json!({"name":"get_observer_health","description":"读取独立 Observer 的最近成功时间、错误和状态文件健康状态。","inputSchema":object_schema(vec![])}),
-            json!({"name":"record_decision","description":"把任务中的关键决策写入任务记录和结构化 Fact Ledger。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("statement",json!({"type":"string"})),("rationale",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}})),("confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
-            json!({"name":"record_failed_approach","description":"记录尝试过但失败的方案、原因和证据，供后续会话避免重复。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("approach",json!({"type":"string"})),("reason",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}}))])}),
+            json!({"name":"record_decision","description":"把任务中的关键决策写入任务记录和结构化 Fact Ledger。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("session_id",json!({"type":"string","maxLength":128})),("statement",json!({"type":"string"})),("rationale",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}})),("confidence",json!({"type":"integer","minimum":0,"maximum":100}))])}),
+            json!({"name":"record_failed_approach","description":"记录尝试过但失败的方案、原因和证据，供后续会话避免重复。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("session_id",json!({"type":"string","maxLength":128})),("approach",json!({"type":"string"})),("reason",json!({"type":"string"})),("evidence",json!({"type":"array","items":{"type":"string"}}))])}),
             json!({"name":"checkpoint_task","description":"按 session 记录长任务检查点、当前结论和相关文件。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("session_id",json!({"type":"string","maxLength":128})),("summary",json!({"type":"string"})),("related_files",json!({"type":"array","items":{"type":"string"}}))])}),
-            json!({"name":"set_task_phase","description":"切换当前任务阶段。","inputSchema":object_schema_with_required(vec![("task_id",json!({"type":"string"})),("phase",json!({"type":"string","enum":["investigate","design","implement","verify","handoff"]}))], &["phase"])}),
-            json!({"name":"reconcile_project_knowledge","description":"检测结构化事实中的重复、冲突、证据漂移和失效，并推荐 merge/supersede/update/delete。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"}))])}),
+            json!({"name":"set_task_phase","description":"切换当前任务阶段。","inputSchema":object_schema_with_required(vec![("task_id",json!({"type":"string"})),("session_id",json!({"type":"string","maxLength":128})),("phase",json!({"type":"string","enum":["investigate","design","implement","verify","handoff"]}))], &["phase"])}),
+            json!({"name":"reconcile_project_knowledge","description":"检测结构化事实中的重复、冲突、证据漂移和失效，并推荐 merge/supersede/update/delete。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("session_id",json!({"type":"string","maxLength":128}))])}),
             json!({"name":"close_task","description":"按 session 关闭当前任务，可同时执行知识对账并返回交接信息。","inputSchema":object_schema(vec![("task_id",json!({"type":"string"})),("session_id",json!({"type":"string","maxLength":128})),("summary",json!({"type":"string"})),("reconcile",json!({"type":"boolean"}))])}),
             json!({"name":"list_project_facts","description":"读取结构化项目事实，可按状态限制数量。","inputSchema":object_schema(vec![("limit",json!({"type":"integer","minimum":1,"maximum":200}))])}),
             json!({"name":"list_tasks","description":"读取最近项目任务记录。","inputSchema":object_schema(vec![("limit",json!({"type":"integer","minimum":1,"maximum":100}))])}),
@@ -1021,6 +1020,7 @@ impl McpServer {
 
     fn record_decision(&self, arguments: Value) -> Result<Value> {
         let task_id = arguments.get("task_id").and_then(Value::as_str);
+        let session_id = arguments.get("session_id").and_then(Value::as_str);
         let statement = required_string(&arguments, "statement")?.to_string();
         let rationale = required_string(&arguments, "rationale")?.to_string();
         let evidence = optional_string_array(&arguments, "evidence")?;
@@ -1029,24 +1029,32 @@ impl McpServer {
             .and_then(Value::as_u64)
             .unwrap_or(90)
             .min(100) as u8;
-        let (task, fact) = record_task_decision(
+        let (task, fact) = record_task_decision_for_session(
             &self.project_root,
             task_id,
             statement,
             rationale,
             evidence,
             confidence,
+            session_id,
         )?;
         Ok(json!({"task":task,"fact":fact}))
     }
 
     fn record_failed_approach(&self, arguments: Value) -> Result<Value> {
         let task_id = arguments.get("task_id").and_then(Value::as_str);
+        let session_id = arguments.get("session_id").and_then(Value::as_str);
         let approach = required_string(&arguments, "approach")?.to_string();
         let reason = required_string(&arguments, "reason")?.to_string();
         let evidence = optional_string_array(&arguments, "evidence")?;
-        let (task, fact) =
-            record_task_failed_approach(&self.project_root, task_id, approach, reason, evidence)?;
+        let (task, fact) = record_task_failed_approach_for_session(
+            &self.project_root,
+            task_id,
+            approach,
+            reason,
+            evidence,
+            session_id,
+        )?;
         Ok(json!({"task":task,"fact":fact}))
     }
 
@@ -1066,8 +1074,11 @@ impl McpServer {
 
     fn set_task_phase(&self, arguments: Value) -> Result<Value> {
         let task_id = arguments.get("task_id").and_then(Value::as_str);
+        let session_id = arguments.get("session_id").and_then(Value::as_str);
         let phase = parse_task_phase(required_string(&arguments, "phase")?)?;
-        Ok(json!({"task":set_project_task_phase(&self.project_root, task_id, phase)?}))
+        Ok(
+            json!({"task":set_project_task_phase_for_session(&self.project_root, task_id, phase, session_id)?}),
+        )
     }
 
     fn reconcile_project_knowledge(&self, arguments: Value) -> Result<Value> {
@@ -1076,10 +1087,13 @@ impl McpServer {
             .and_then(Value::as_str)
             .map(ToString::to_string)
             .or_else(|| {
-                core_get_active_task(&self.project_root)
-                    .ok()
-                    .flatten()
-                    .map(|task| task.id)
+                core_get_active_task_for_session(
+                    &self.project_root,
+                    arguments.get("session_id").and_then(Value::as_str),
+                )
+                .ok()
+                .flatten()
+                .map(|task| task.id)
             });
         Ok(json!({"report":core_reconcile_project_knowledge(
             &self.project_root,

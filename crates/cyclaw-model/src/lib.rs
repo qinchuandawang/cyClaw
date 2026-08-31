@@ -87,6 +87,10 @@ pub struct ModelUsage {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub total_tokens: usize,
+    #[serde(default)]
+    pub reserved_tokens: usize,
+    #[serde(default)]
+    pub reservation_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,23 +201,28 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
             policy.model_policy.max_input_tokens
         );
     }
-    reserve_daily_budget(&options.project_root, &policy, estimated_input)?;
-
     let api_key = std::env::var(&provider.api_key_env)
         .with_context(|| format!("环境变量未设置: {}", provider.api_key_env))?;
     enforce_min_interval(
         &options.project_root,
         policy.model_policy.min_interval_millis,
     )?;
+    let reserved_tokens = reserve_daily_budget(&options.project_root, &policy, estimated_input)?;
     let started = Instant::now();
-    let completion = test_openai_compatible(
+    let completion = match test_openai_compatible(
         provider,
         &api_key,
         &prompt,
         Duration::from_secs(policy.model_policy.request_timeout_seconds.max(1)),
         policy.model_policy.max_retries,
         policy.model_policy.max_output_tokens,
-    )?;
+    ) {
+        Ok(completion) => completion,
+        Err(error) => {
+            release_reserved_usage(&options.project_root, reserved_tokens)?;
+            return Err(error);
+        }
+    };
     let latency_millis = started.elapsed().as_millis();
     let input_tokens = completion.input_tokens.unwrap_or(estimated_input);
     let output_tokens = completion
@@ -222,12 +231,16 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
     let total_tokens = completion
         .total_tokens
         .unwrap_or(input_tokens.saturating_add(output_tokens));
-    record_usage(
+    if let Err(error) = record_usage(
         &options.project_root,
         input_tokens,
         output_tokens,
         total_tokens,
-    )?;
+        reserved_tokens,
+    ) {
+        let _ = release_reserved_usage(&options.project_root, reserved_tokens);
+        return Err(error);
+    }
     if policy.model_policy.cache_model_responses {
         write_cached_response(&options.project_root, &cache_key, &completion.response)?;
     }
@@ -525,6 +538,8 @@ fn read_usage(project_root: &Path) -> ModelUsage {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
+            reserved_tokens: 0,
+            reservation_updated_at: None,
         })
 }
 
@@ -536,13 +551,28 @@ fn reserve_daily_budget(
     project_root: &Path,
     policy: &cyclaw_policy::PolicyConfig,
     estimated_input: usize,
-) -> Result<()> {
+) -> Result<usize> {
     let _lock = acquire_lock(project_root, "model-usage", Duration::from_secs(5))?;
-    let usage = read_usage(project_root);
+    let mut usage = read_usage(project_root);
+    if usage
+        .reservation_updated_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|time| {
+            chrono::Utc::now()
+                .signed_duration_since(time.with_timezone(&chrono::Utc))
+                .num_hours()
+                >= 2
+        })
+    {
+        usage.reserved_tokens = 0;
+        usage.reservation_updated_at = None;
+    }
+    let reserved_tokens = estimated_input.saturating_add(policy.model_policy.max_output_tokens);
     let projected = usage
         .total_tokens
-        .saturating_add(estimated_input)
-        .saturating_add(policy.model_policy.max_output_tokens);
+        .saturating_add(usage.reserved_tokens)
+        .saturating_add(reserved_tokens);
     if projected > policy.model_policy.daily_token_budget {
         anyhow::bail!(
             "模型日预算不足: 预计 {} tokens，预算 {} tokens",
@@ -550,7 +580,10 @@ fn reserve_daily_budget(
             policy.model_policy.daily_token_budget
         );
     }
-    Ok(())
+    usage.reserved_tokens = usage.reserved_tokens.saturating_add(reserved_tokens);
+    usage.reservation_updated_at = Some(chrono::Utc::now().to_rfc3339());
+    write_usage(project_root, &usage)?;
+    Ok(reserved_tokens)
 }
 
 fn record_usage(
@@ -558,6 +591,7 @@ fn record_usage(
     input_tokens: usize,
     output_tokens: usize,
     total_tokens: usize,
+    reserved_tokens: usize,
 ) -> Result<()> {
     let _lock = acquire_lock(project_root, "model-usage", Duration::from_secs(5))?;
     let mut usage = read_usage(project_root);
@@ -565,12 +599,30 @@ fn record_usage(
     usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
     usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
     usage.total_tokens = usage.total_tokens.saturating_add(total_tokens);
+    usage.reserved_tokens = usage.reserved_tokens.saturating_sub(reserved_tokens);
+    if usage.reserved_tokens == 0 {
+        usage.reservation_updated_at = None;
+    }
+    write_usage(project_root, &usage)
+}
+
+fn release_reserved_usage(project_root: &Path, reserved_tokens: usize) -> Result<()> {
+    let _lock = acquire_lock(project_root, "model-usage", Duration::from_secs(5))?;
+    let mut usage = read_usage(project_root);
+    usage.reserved_tokens = usage.reserved_tokens.saturating_sub(reserved_tokens);
+    if usage.reserved_tokens == 0 {
+        usage.reservation_updated_at = None;
+    }
+    write_usage(project_root, &usage)
+}
+
+fn write_usage(project_root: &Path, usage: &ModelUsage) -> Result<()> {
     let path = usage_path(project_root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut temporary = NamedTempFile::new_in(path.parent().unwrap())?;
-    serde_json::to_writer_pretty(&mut temporary, &usage)?;
+    serde_json::to_writer_pretty(&mut temporary, usage)?;
     temporary.as_file().sync_all()?;
     temporary.persist(&path).map_err(|error| error.error)?;
     Ok(())
@@ -696,7 +748,7 @@ mod tests {
     #[test]
     fn persists_daily_model_usage() {
         let temp = tempfile::tempdir().unwrap();
-        record_usage(temp.path(), 10, 5, 15).unwrap();
+        record_usage(temp.path(), 10, 5, 15, 15).unwrap();
         let usage = read_model_usage(temp.path());
         assert_eq!(usage.calls, 1);
         assert_eq!(usage.input_tokens, 10);

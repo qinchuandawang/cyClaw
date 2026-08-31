@@ -36,6 +36,7 @@ use cyclaw_policy::{
     PermissionLevel, acquire_lock, check_write_path, load_or_default, set_permission,
 };
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use tempfile::NamedTempFile;
 
 #[derive(Parser)]
 #[command(name = "cyclaw")]
@@ -910,18 +911,20 @@ fn main() -> Result<()> {
             };
             let executable = command.first().context("缺少要执行的命令")?;
             let started = std::time::Instant::now();
+            // 使用临时文件承接输出，避免大输出填满管道导致子进程死锁。
+            let stdout_file = NamedTempFile::new()?;
+            let stderr_file = NamedTempFile::new()?;
             let mut child = Command::new(executable)
                 .args(&command[1..])
                 .current_dir(&project_root)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::from(stdout_file.reopen()?))
+                .stderr(std::process::Stdio::from(stderr_file.reopen()?))
                 .spawn()?;
             let timeout = (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds));
             loop {
                 if let Some(status) = child.try_wait()? {
-                    let output = child.wait_with_output()?;
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = fs::read_to_string(stderr_file.path()).unwrap_or_default();
+                    let stdout = fs::read_to_string(stdout_file.path()).unwrap_or_default();
                     let error_summary =
                         (!stderr.trim().is_empty()).then(|| truncate_output(&stderr));
                     let event = new_execution_event_with_context(
@@ -946,6 +949,7 @@ fn main() -> Result<()> {
                 if timeout.is_some_and(|limit| started.elapsed() >= limit) {
                     let _ = child.kill();
                     let status = child.wait()?;
+                    let stderr = fs::read_to_string(stderr_file.path()).unwrap_or_default();
                     let event = new_execution_event_with_context(
                         "cyclaw-cli",
                         event_kind,
@@ -953,7 +957,15 @@ fn main() -> Result<()> {
                         status.code(),
                         true,
                         related_files,
-                        Some(format!("命令执行超过 {} 秒", timeout_seconds)),
+                        Some(if stderr.trim().is_empty() {
+                            format!("命令执行超过 {} 秒", timeout_seconds)
+                        } else {
+                            format!(
+                                "命令执行超过 {} 秒: {}",
+                                timeout_seconds,
+                                truncate_output(&stderr)
+                            )
+                        }),
                         session_id,
                         trace_id,
                         git_head(&project_root),
@@ -1013,7 +1025,7 @@ fn main() -> Result<()> {
                 loop {
                     match receiver.recv_timeout(maintenance) {
                         Ok(Ok(event)) => {
-                            let _ = record_observer_metrics(&project_root, 1, 0, 0, 0);
+                            let _ = record_observer_metrics(&project_root, 1, 0, 0, 0, 0);
                             if !is_relevant_watch_event(&project_root, &event) {
                                 continue;
                             }
@@ -1025,7 +1037,8 @@ fn main() -> Result<()> {
                                 coalesced += 1;
                             }
                             if coalesced > 0 {
-                                let _ = record_observer_metrics(&project_root, 0, coalesced, 0, 0);
+                                let _ =
+                                    record_observer_metrics(&project_root, 0, coalesced, 0, 0, 0);
                             }
                             let artifact_events =
                                 match observe_execution_artifacts(&project_root, &paths) {
@@ -1052,7 +1065,7 @@ fn main() -> Result<()> {
                         Ok(Err(error)) => eprintln!("文件观察事件异常: {}", error),
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             if rescan_required.swap(false, Ordering::AcqRel) {
-                                let _ = record_observer_metrics(&project_root, 0, 0, 1, 1);
+                                let _ = record_observer_metrics(&project_root, 0, 0, 1, 1, 1);
                                 if let Err(error) = observe_project_once(&project_root) {
                                     let _ = record_observer_error(&project_root, &error);
                                     return Err(error);
