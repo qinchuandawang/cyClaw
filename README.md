@@ -245,6 +245,8 @@ cargo run -p cyclaw-cli -- agent runs clean --keep 20
 - `get_model_usage`：读取当日模型调用次数、Token 用量和日预算。
 - `cyclaw exec --kind test -- cargo test`：通过统一命令包装器执行测试、构建或其他命令，自动记录退出码、超时、错误摘要、Git commit、session_id 和 trace_id，并将失败送入候选层。
 - MCP `begin_task` 可传入 `session_id`；不同窗口的活动任务指针按 session 隔离，项目级 Fact 仍可共享。
+- `get_active_task`、`get_task_context`、`checkpoint_task` 和 `close_task` 同样支持 `session_id`，显式 task_id 也会校验任务归属。
+- Agent 模型审查会先持久化 pending 状态；调用失败或进程中断后，下次运行复用原 run_id 继续审查，成功后清理恢复状态。
 - `run_agent`、`set_runtime_strategy`：兼容性的批处理审阅与策略设置，不承担事件采集职责。
 - `doctor`：检查 Git、初始化、权限、候选、活动模型和文档写入状态。
 - `begin_task`、`get_active_task`、`get_task_context`：历史兼容的任务上下文读取接口。

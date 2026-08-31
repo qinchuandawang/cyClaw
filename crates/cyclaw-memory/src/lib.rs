@@ -778,10 +778,21 @@ pub fn checkpoint_task(
     summary: String,
     related_files: Vec<String>,
 ) -> Result<TaskRecord> {
+    checkpoint_task_for_session(project_root, task_id, summary, related_files, None)
+}
+
+pub fn checkpoint_task_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    summary: String,
+    related_files: Vec<String>,
+    session_id: Option<&str>,
+) -> Result<TaskRecord> {
     ensure_memory_dirs(project_root)?;
     let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
-    let id = resolve_task_id(project_root, task_id)?;
+    let id = resolve_task_id_for_session(project_root, task_id, session_id)?;
     let mut task = read_task(project_root, &id)?;
+    ensure_task_session(&task, session_id)?;
     ensure_active(&task)?;
     let now = Utc::now().to_rfc3339();
     let files = dedupe_strings(related_files);
@@ -810,10 +821,20 @@ pub fn close_task(
     task_id: Option<&str>,
     summary: String,
 ) -> Result<TaskRecord> {
+    close_task_for_session(project_root, task_id, summary, None)
+}
+
+pub fn close_task_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    summary: String,
+    session_id: Option<&str>,
+) -> Result<TaskRecord> {
     ensure_memory_dirs(project_root)?;
     let _lock = acquire_lock(project_root, "memory", Duration::from_secs(5))?;
-    let id = resolve_task_id(project_root, task_id)?;
+    let id = resolve_task_id_for_session(project_root, task_id, session_id)?;
     let mut task = read_task(project_root, &id)?;
+    ensure_task_session(&task, session_id)?;
     ensure_active(&task)?;
     let now = Utc::now().to_rfc3339();
     task.status = TaskStatus::Closed;
@@ -2350,10 +2371,19 @@ fn finding(
 }
 
 fn resolve_task_id(project_root: &Path, task_id: Option<&str>) -> Result<String> {
+    resolve_task_id_for_session(project_root, task_id, None)
+}
+
+fn resolve_task_id_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<String> {
     if let Some(id) = task_id {
         return Ok(id.to_string());
     }
-    read_active_task_id(project_root)?.context("当前没有活动任务，请先调用 begin_task")
+    read_active_task_id_for_session(project_root, session_id)?
+        .context("当前没有活动任务，请先调用 begin_task")
 }
 
 fn push_task_activity(task: &mut TaskRecord, kind: &str, summary: String, created_at: String) {
@@ -2394,8 +2424,13 @@ fn ensure_active(task: &TaskRecord) -> Result<()> {
     Ok(())
 }
 
-fn read_active_task_id(project_root: &Path) -> Result<Option<String>> {
-    read_active_task_id_for_session(project_root, None)
+fn ensure_task_session(task: &TaskRecord, session_id: Option<&str>) -> Result<()> {
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty())
+        && task.session_id.as_deref() != Some(session_id)
+    {
+        anyhow::bail!("任务不属于当前 session: {}", session_id);
+    }
+    Ok(())
 }
 
 fn read_active_task_id_for_session(

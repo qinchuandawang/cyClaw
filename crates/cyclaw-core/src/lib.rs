@@ -32,7 +32,9 @@ pub use cyclaw_memory::{
 };
 use cyclaw_memory::{
     apply_fact_patch as memory_apply_fact_patch, begin_task as memory_begin_task,
-    checkpoint_task as memory_checkpoint_task, close_task as memory_close_task,
+    checkpoint_task as memory_checkpoint_task,
+    checkpoint_task_for_session as memory_checkpoint_task_for_session,
+    close_task as memory_close_task, close_task_for_session as memory_close_task_for_session,
     compile_fact_context,
     diagnose_fact_patch_transactions as memory_diagnose_fact_patch_transactions,
     get_active_task as memory_active_task, get_task as memory_get_task,
@@ -1103,6 +1105,13 @@ pub fn get_active_task(project_root: &Path) -> Result<Option<TaskRecord>> {
     memory_active_task(project_root)
 }
 
+pub fn get_active_task_for_session(
+    project_root: &Path,
+    session_id: Option<&str>,
+) -> Result<Option<TaskRecord>> {
+    cyclaw_memory::get_active_task_for_session(project_root, session_id)
+}
+
 pub fn get_task(project_root: &Path, task_id: &str) -> Result<TaskRecord> {
     memory_get_task(project_root, task_id)
 }
@@ -1195,10 +1204,28 @@ pub fn get_task_context(
     budget_tokens: Option<usize>,
     limit: usize,
 ) -> Result<TaskContextPack> {
+    get_task_context_for_session(project_root, task_id, query, budget_tokens, limit, None)
+}
+
+pub fn get_task_context_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    query: Option<&str>,
+    budget_tokens: Option<usize>,
+    limit: usize,
+    session_id: Option<&str>,
+) -> Result<TaskContextPack> {
     let task = match task_id {
         Some(id) => Some(memory_get_task(project_root, id)?),
-        None => memory_active_task(project_root)?,
+        None => cyclaw_memory::get_active_task_for_session(project_root, session_id)?,
     };
+    if let (Some(task), Some(session_id)) = (
+        task.as_ref(),
+        session_id.filter(|value| !value.trim().is_empty()),
+    ) && task.session_id.as_deref() != Some(session_id)
+    {
+        anyhow::bail!("任务不属于当前 session: {}", session_id);
+    }
     let explicit_query = query.filter(|value| !value.trim().is_empty());
     let query = explicit_query.map(ToString::to_string).unwrap_or_else(|| {
         task.as_ref()
@@ -1375,6 +1402,16 @@ pub fn checkpoint_task(
     memory_checkpoint_task(project_root, task_id, summary, related_files)
 }
 
+pub fn checkpoint_task_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    summary: String,
+    related_files: Vec<String>,
+    session_id: Option<&str>,
+) -> Result<TaskRecord> {
+    memory_checkpoint_task_for_session(project_root, task_id, summary, related_files, session_id)
+}
+
 pub fn reconcile_project_knowledge(
     project_root: &Path,
     task_id: Option<String>,
@@ -1389,6 +1426,28 @@ pub fn close_task(
     reconcile: bool,
 ) -> Result<CloseTaskResult> {
     let task = memory_close_task(project_root, task_id, summary)?;
+    let reconciliation = if reconcile {
+        Some(memory_reconcile_knowledge(
+            project_root,
+            Some(task.id.clone()),
+        )?)
+    } else {
+        None
+    };
+    Ok(CloseTaskResult {
+        task,
+        reconciliation,
+    })
+}
+
+pub fn close_task_for_session(
+    project_root: &Path,
+    task_id: Option<&str>,
+    summary: String,
+    reconcile: bool,
+    session_id: Option<&str>,
+) -> Result<CloseTaskResult> {
+    let task = memory_close_task_for_session(project_root, task_id, summary, session_id)?;
     let reconciliation = if reconcile {
         Some(memory_reconcile_knowledge(
             project_root,

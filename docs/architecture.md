@@ -42,6 +42,6 @@ Fact 与 Fact Patch ID 在存储层执行长度、字符集和前缀校验，Pat
 
 ## 数据边界
 
-所有运行状态按项目写入 `<project>/.cyclaw/`。任务记录、Fact Ledger、对账报告、候选、Patch、索引和事件均不跨项目共享；带 `session_id` 的活动任务指针按窗口隔离，项目级 Fact 仍可共享。模型调用只发生在用户配置 Provider 并授权后。
+所有运行状态按项目写入 `<project>/.cyclaw/`。任务记录、Fact Ledger、对账报告、候选、Patch、索引和事件均不跨项目共享；带 `session_id` 的活动任务指针按窗口隔离，项目级 Fact 仍可共享。Agent 模型审查状态写入 `.cyclaw/agent-run-state.json`，失败后可按相同 run_id 恢复。模型调用只发生在用户配置 Provider 并授权后。
 
 详细设计、技术选择和阶段计划见 [技术架构](cyclaw-tech-architecture-v0.1.md)、[运行时设计](cyclaw-agent-runtime-design-v0.1.md) 和 [Agent 集成方案](cyclaw-agent-integrations-v0.1.md)。

@@ -58,6 +58,18 @@ pub struct AgentRunRecord {
     pub model_provider: Option<String>,
     /// 仅保存脱敏摘要，避免把外部模型输出作为长期项目数据留存。
     pub model_response_summary: Option<String>,
+    #[serde(default)]
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentRunState {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub phase: String,
+    pub provider: Option<String>,
+    pub pending_candidate_ids: Vec<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +137,13 @@ pub fn cleanup_agent_runs(project_root: &Path, keep: usize) -> Result<usize> {
 pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
     ensure_directory(&options.project_root)?;
     let started_at = Utc::now();
-    let run_id = new_id("agent");
+    let state_path = run_state_path(&options.project_root);
+    let previous_state = read_run_state(&state_path)?;
+    let resumed = previous_state.is_some();
+    let run_id = previous_state
+        .as_ref()
+        .map(|state| state.run_id.clone())
+        .unwrap_or_else(|| new_id("agent"));
     let mut steps = Vec::new();
 
     let status = project_status(options.project_root.clone())?;
@@ -207,60 +225,85 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
     if options.use_model {
         match resolve_provider(&options.project_root, options.provider.clone()) {
             Ok(Some(provider_name)) => {
+                write_run_state(
+                    &state_path,
+                    &AgentRunState {
+                        schema_version: 1,
+                        run_id: run_id.clone(),
+                        phase: "model_review_pending".to_string(),
+                        provider: Some(provider_name.clone()),
+                        pending_candidate_ids: pending_candidates
+                            .iter()
+                            .map(|candidate| candidate.id.clone())
+                            .collect(),
+                        updated_at: Utc::now().to_rfc3339(),
+                    },
+                )?;
                 let prompt = render_agent_prompt(&pending_candidates, &pending_patches);
-                let result = test_provider(TestProviderOptions {
+                let model_result = test_provider(TestProviderOptions {
                     project_root: options.project_root.clone(),
                     name: provider_name.clone(),
                     prompt,
-                })?;
-                append_event(
-                    &options.project_root,
-                    &new_event(
-                        AgentEventType::ModelCalled,
-                        "cyclaw-agent",
-                        "模型调用完成",
-                        serde_json::json!({
-                            "provider": provider_name.clone(),
-                            "model_response_chars": result.response.chars().count(),
-                            "input_tokens": result.input_tokens,
-                            "output_tokens": result.output_tokens,
-                            "total_tokens": result.total_tokens,
-                            "latency_millis": result.latency_millis,
-                            "cache_hit": result.cache_hit,
-                        }),
-                    ),
-                )?;
-                let review_result = parse_model_reviews(&result.response);
+                });
                 let mut reviewed = 0;
                 let mut review_error = None;
-                match review_result {
-                    Ok(response) => {
-                        for review in response.reviews {
-                            if !pending_candidates
-                                .iter()
-                                .any(|candidate| candidate.id == review.candidate_id)
-                            {
-                                review_error =
-                                    Some(format!("模型返回未知候选: {}", review.candidate_id));
-                                break;
+                let mut response_summary = None;
+                match model_result {
+                    Ok(result) => {
+                        append_event(
+                            &options.project_root,
+                            &new_event(
+                                AgentEventType::ModelCalled,
+                                "cyclaw-agent",
+                                "模型调用完成",
+                                serde_json::json!({
+                                    "provider": provider_name.clone(),
+                                    "model_response_chars": result.response.chars().count(),
+                                    "input_tokens": result.input_tokens,
+                                    "output_tokens": result.output_tokens,
+                                    "total_tokens": result.total_tokens,
+                                    "latency_millis": result.latency_millis,
+                                    "cache_hit": result.cache_hit,
+                                }),
+                            ),
+                        )?;
+                        response_summary = Some(summarize_model_response(&result.response));
+                        match parse_model_reviews(&result.response) {
+                            Ok(response) => {
+                                for review in response.reviews {
+                                    if !pending_candidates
+                                        .iter()
+                                        .any(|candidate| candidate.id == review.candidate_id)
+                                    {
+                                        review_error = Some(format!(
+                                            "模型返回未知候选: {}",
+                                            review.candidate_id
+                                        ));
+                                        break;
+                                    }
+                                    if update_candidate_review(
+                                        options.project_root.clone(),
+                                        &review.candidate_id,
+                                        review.confidence,
+                                        review.recommendation,
+                                        review.rationale,
+                                    )
+                                    .is_ok()
+                                    {
+                                        reviewed += 1;
+                                    }
+                                }
                             }
-                            if update_candidate_review(
-                                options.project_root.clone(),
-                                &review.candidate_id,
-                                review.confidence,
-                                review.recommendation,
-                                review.rationale,
-                            )
-                            .is_ok()
-                            {
-                                reviewed += 1;
-                            }
+                            Err(error) => review_error = Some(error.to_string()),
                         }
                     }
                     Err(error) => review_error = Some(error.to_string()),
                 }
                 model_provider = Some(provider_name.clone());
-                model_response_summary = Some(summarize_model_response(&result.response));
+                model_response_summary = response_summary;
+                if review_error.is_none() {
+                    remove_run_state(&state_path)?;
+                }
                 steps.push(AgentStep {
                     name: "model_review".to_string(),
                     status: if review_error.is_none() {
@@ -274,6 +317,7 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
                 });
             }
             Ok(None) => {
+                remove_run_state(&state_path)?;
                 steps.push(AgentStep {
                     name: "model_review".to_string(),
                     status: AgentStepStatus::Skipped,
@@ -289,6 +333,7 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
             }
         }
     } else {
+        remove_run_state(&state_path)?;
         steps.push(AgentStep {
             name: "model_review".to_string(),
             status: AgentStepStatus::Skipped,
@@ -315,6 +360,7 @@ pub fn run_agent_once(options: AgentRunOptions) -> Result<AgentRunResult> {
         pending_patch_count: pending_patches.len(),
         model_provider,
         model_response_summary,
+        resumed,
     };
     let record_path = write_record(&options.project_root, &record)?;
     append_event(
@@ -427,6 +473,37 @@ fn write_record(project_root: &Path, record: &AgentRunRecord) -> Result<PathBuf>
     fs::write(&record_path, json)
         .with_context(|| format!("无法写入 Agent 运行记录: {}", record_path.display()))?;
     Ok(record_path)
+}
+
+fn run_state_path(project_root: &Path) -> PathBuf {
+    project_root.join(CYCLE_DIR).join("agent-run-state.json")
+}
+
+fn read_run_state(path: &Path) -> Result<Option<AgentRunState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("无法读取 Agent 恢复状态: {}", path.display()))?;
+    Ok(Some(serde_json::from_str(&content)?))
+}
+
+fn write_run_state(path: &Path, state: &AgentRunState) -> Result<()> {
+    let parent = path.parent().context("Agent 恢复状态缺少父目录")?;
+    fs::create_dir_all(parent)?;
+    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(temporary.as_file(), state)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn remove_run_state(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("无法清理 Agent 恢复状态: {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
