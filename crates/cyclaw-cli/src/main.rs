@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cyclaw_agent::{AgentRunOptions, cleanup_agent_runs, list_agent_runs, run_agent_once};
 use cyclaw_core::{
@@ -21,11 +21,12 @@ use cyclaw_core::{
     list_project_facts, list_tasks, maintain_project_knowledge, observe_execution_artifacts,
     observe_project_once, observer_health, preview_fact_patch, project_fact_from_input,
     project_status, query_evidence_verifications, query_fact_patches, reconcile_project_knowledge,
-    record_observer_error, record_task_decision, record_task_failed_approach,
-    revert_document_patch, revert_fact_patch, scan_project, search_project, update_inbox_status,
-    verify_fact_evidence, watch_project_once,
+    record_execution_event, record_observer_error, record_observer_metrics, record_task_decision,
+    record_task_failed_approach, revert_document_patch, revert_fact_patch, scan_project,
+    search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
 };
 use cyclaw_docs::KnowledgeOperation;
+use cyclaw_events::{ExecutionEventKind, new_execution_event_with_context};
 use cyclaw_knowledge::{KnowledgeImportance, KnowledgeStatus};
 use cyclaw_model::{
     AddProviderOptions, TestProviderOptions, add_provider, list_providers, test_provider,
@@ -70,6 +71,30 @@ enum Commands {
         /// 项目根目录，默认使用当前目录
         #[arg(short, long)]
         path: Option<PathBuf>,
+    },
+    /// 执行命令并自动记录执行事件；命令参数放在 -- 后
+    Exec {
+        /// 执行类型
+        #[arg(long, default_value = "command")]
+        kind: String,
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// 当前 Coding Agent 会话 ID
+        #[arg(long)]
+        session_id: Option<String>,
+        /// 当前调用链追踪 ID
+        #[arg(long)]
+        trace_id: Option<String>,
+        /// 关联代码或配置文件，可重复传入
+        #[arg(long = "related-file")]
+        related_files: Vec<String>,
+        /// 超时时间，单位秒；0 表示不设超时
+        #[arg(long, default_value_t = 0)]
+        timeout_seconds: u64,
+        /// 要执行的命令，使用 `--` 与 cyClaw 参数分隔
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     /// 常驻监听 Git 变更，自动生成变更雷达报告
     Watch {
@@ -866,6 +891,84 @@ fn main() -> Result<()> {
                 println!("- {}：{}", asset.asset, asset.reason);
             }
         }
+        Commands::Exec {
+            kind,
+            path,
+            session_id,
+            trace_id,
+            related_files,
+            timeout_seconds,
+            command,
+        } => {
+            let project_root = resolve_path(path)?;
+            let event_kind = match kind.as_str() {
+                "command" => ExecutionEventKind::Command,
+                "build" => ExecutionEventKind::Build,
+                "test" => ExecutionEventKind::Test,
+                "patch" => ExecutionEventKind::Patch,
+                value => anyhow::bail!("不支持的执行类型: {}", value),
+            };
+            let executable = command.first().context("缺少要执行的命令")?;
+            let started = std::time::Instant::now();
+            let mut child = Command::new(executable)
+                .args(&command[1..])
+                .current_dir(&project_root)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+            let timeout = (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds));
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    let output = child.wait_with_output()?;
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let error_summary =
+                        (!stderr.trim().is_empty()).then(|| truncate_output(&stderr));
+                    let event = new_execution_event_with_context(
+                        "cyclaw-cli",
+                        event_kind,
+                        command.join(" "),
+                        status.code(),
+                        false,
+                        related_files,
+                        error_summary,
+                        session_id,
+                        trace_id,
+                        git_head(&project_root),
+                        Some(started.elapsed().as_millis()),
+                    );
+                    let result = record_execution_event(project_root, event)?;
+                    print!("{}", stdout);
+                    eprint!("{}", stderr);
+                    eprintln!("cyClaw 执行事件已记录: duplicate={}", result.duplicate);
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                    let _ = child.kill();
+                    let status = child.wait()?;
+                    let event = new_execution_event_with_context(
+                        "cyclaw-cli",
+                        event_kind,
+                        command.join(" "),
+                        status.code(),
+                        true,
+                        related_files,
+                        Some(format!("命令执行超过 {} 秒", timeout_seconds)),
+                        session_id,
+                        trace_id,
+                        git_head(&project_root),
+                        Some(started.elapsed().as_millis()),
+                    );
+                    let result = record_execution_event(project_root, event)?;
+                    eprintln!(
+                        "cyClaw 执行超时，事件已记录: duplicate={}",
+                        result.duplicate
+                    );
+                    std::process::exit(124);
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
         Commands::Observer { command } => match command {
             ObserverCommand::Run {
                 path,
@@ -910,13 +1013,19 @@ fn main() -> Result<()> {
                 loop {
                     match receiver.recv_timeout(maintenance) {
                         Ok(Ok(event)) => {
+                            let _ = record_observer_metrics(&project_root, 1, 0, 0, 0);
                             if !is_relevant_watch_event(&project_root, &event) {
                                 continue;
                             }
                             let mut paths = event.paths;
                             thread::sleep(debounce);
+                            let mut coalesced = 0;
                             while let Ok(Ok(next)) = receiver.try_recv() {
                                 paths.extend(next.paths);
+                                coalesced += 1;
+                            }
+                            if coalesced > 0 {
+                                let _ = record_observer_metrics(&project_root, 0, coalesced, 0, 0);
                             }
                             let artifact_events =
                                 match observe_execution_artifacts(&project_root, &paths) {
@@ -942,11 +1051,12 @@ fn main() -> Result<()> {
                         }
                         Ok(Err(error)) => eprintln!("文件观察事件异常: {}", error),
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if rescan_required.swap(false, Ordering::AcqRel)
-                                && let Err(error) = observe_project_once(&project_root)
-                            {
-                                let _ = record_observer_error(&project_root, &error);
-                                return Err(error);
+                            if rescan_required.swap(false, Ordering::AcqRel) {
+                                let _ = record_observer_metrics(&project_root, 0, 0, 1, 1);
+                                if let Err(error) = observe_project_once(&project_root) {
+                                    let _ = record_observer_error(&project_root, &error);
+                                    return Err(error);
+                                }
                             }
                             let (verified, report) = match maintain_project_knowledge(&project_root)
                             {
@@ -1840,6 +1950,21 @@ fn resolve_path(path: Option<PathBuf>) -> Result<PathBuf> {
         None => std::env::current_dir()?,
     };
     Ok(path.canonicalize()?)
+}
+
+fn truncate_output(output: &str) -> String {
+    output.chars().take(2000).collect()
+}
+
+fn git_head(project_root: &Path) -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn observer_task_name(project_root: &Path) -> String {

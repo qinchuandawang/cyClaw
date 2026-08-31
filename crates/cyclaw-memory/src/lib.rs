@@ -76,6 +76,8 @@ pub struct TaskActivity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRecord {
     pub id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub title: String,
     pub objective: String,
     pub status: TaskStatus,
@@ -106,6 +108,7 @@ pub struct BeginTaskOptions {
     pub context_budget_tokens: usize,
     pub phase: TaskPhase,
     pub git_head: Option<String>,
+    pub session_id: Option<String>,
 }
 
 impl BeginTaskOptions {
@@ -118,6 +121,7 @@ impl BeginTaskOptions {
             context_budget_tokens: 2_000,
             phase: TaskPhase::default(),
             git_head: None,
+            session_id: None,
         }
     }
 }
@@ -558,12 +562,15 @@ pub struct ReconciliationReport {
 pub fn begin_task(options: BeginTaskOptions) -> Result<TaskRecord> {
     ensure_memory_dirs(&options.project_root)?;
     let _lock = acquire_lock(&options.project_root, "memory", Duration::from_secs(5))?;
-    if let Some(active) = read_active_task_id(&options.project_root)? {
+    if let Some(active) =
+        read_active_task_id_for_session(&options.project_root, options.session_id.as_deref())?
+    {
         anyhow::bail!("已有活动任务，请先关闭: {}", active);
     }
     let now = Utc::now().to_rfc3339();
     let task = TaskRecord {
         id: new_id("task"),
+        session_id: options.session_id.clone(),
         title: options.title,
         objective: options.objective,
         status: TaskStatus::Active,
@@ -582,7 +589,11 @@ pub fn begin_task(options: BeginTaskOptions) -> Result<TaskRecord> {
         closed_at: None,
     };
     write_task(&options.project_root, &task)?;
-    fs::write(active_task_path(&options.project_root), &task.id)?;
+    write_active_task_id(
+        &options.project_root,
+        options.session_id.as_deref(),
+        &task.id,
+    )?;
     record_event(
         &options.project_root,
         AgentEventType::TaskStarted,
@@ -593,7 +604,14 @@ pub fn begin_task(options: BeginTaskOptions) -> Result<TaskRecord> {
 }
 
 pub fn get_active_task(project_root: &Path) -> Result<Option<TaskRecord>> {
-    let Some(id) = read_active_task_id(project_root)? else {
+    get_active_task_for_session(project_root, None)
+}
+
+pub fn get_active_task_for_session(
+    project_root: &Path,
+    session_id: Option<&str>,
+) -> Result<Option<TaskRecord>> {
+    let Some(id) = read_active_task_id_for_session(project_root, session_id)? else {
         return Ok(None);
     };
     Ok(Some(read_task(project_root, &id)?))
@@ -803,8 +821,10 @@ pub fn close_task(
     task.updated_at = now.clone();
     task.closed_at = Some(now);
     write_task(project_root, &task)?;
-    if read_active_task_id(project_root)?.as_deref() == Some(id.as_str()) {
-        let path = active_task_path(project_root);
+    if read_active_task_id_for_session(project_root, task.session_id.as_deref())?.as_deref()
+        == Some(id.as_str())
+    {
+        let path = active_task_path_for_session(project_root, task.session_id.as_deref());
         if path.exists() {
             fs::remove_file(path)?;
         }
@@ -2375,12 +2395,32 @@ fn ensure_active(task: &TaskRecord) -> Result<()> {
 }
 
 fn read_active_task_id(project_root: &Path) -> Result<Option<String>> {
-    let path = active_task_path(project_root);
+    read_active_task_id_for_session(project_root, None)
+}
+
+fn read_active_task_id_for_session(
+    project_root: &Path,
+    session_id: Option<&str>,
+) -> Result<Option<String>> {
+    let path = active_task_path_for_session(project_root, session_id);
     if !path.exists() {
         return Ok(None);
     }
     let id = fs::read_to_string(path)?.trim().to_string();
     Ok((!id.is_empty()).then_some(id))
+}
+
+fn write_active_task_id(
+    project_root: &Path,
+    session_id: Option<&str>,
+    task_id: &str,
+) -> Result<()> {
+    let path = active_task_path_for_session(project_root, session_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, task_id)?;
+    Ok(())
 }
 
 fn read_task(project_root: &Path, task_id: &str) -> Result<TaskRecord> {
@@ -2417,6 +2457,30 @@ fn task_path(project_root: &Path, task_id: &str) -> PathBuf {
 
 fn active_task_path(project_root: &Path) -> PathBuf {
     project_root.join(CYCLE_DIR).join("active-task")
+}
+
+fn active_task_path_for_session(project_root: &Path, session_id: Option<&str>) -> PathBuf {
+    match session_id.filter(|value| !value.trim().is_empty()) {
+        Some(session_id) => project_root
+            .join(CYCLE_DIR)
+            .join("active-tasks")
+            .join(format!("{}.txt", safe_identifier(session_id))),
+        None => active_task_path(project_root),
+    }
+}
+
+fn safe_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect()
 }
 
 fn memory_dir(project_root: &Path) -> PathBuf {
@@ -2964,6 +3028,36 @@ mod tests {
         let context = compile_fact_context(temp.path(), "退款处理中", 500, 10).unwrap();
         assert_eq!(context.facts.len(), 1);
         assert!(context.facts[0].fact.statement.contains("不得重新"));
+    }
+
+    #[test]
+    fn session_tasks_have_isolated_active_pointers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = begin_task(BeginTaskOptions {
+            session_id: Some("session-a".to_string()),
+            ..BeginTaskOptions::new(temp.path().to_path_buf(), "A".to_string(), "A".to_string())
+        })
+        .unwrap();
+        let second = begin_task(BeginTaskOptions {
+            session_id: Some("session-b".to_string()),
+            ..BeginTaskOptions::new(temp.path().to_path_buf(), "B".to_string(), "B".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(
+            get_active_task_for_session(temp.path(), Some("session-a"))
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert_eq!(
+            get_active_task_for_session(temp.path(), Some("session-b"))
+                .unwrap()
+                .unwrap()
+                .id,
+            second.id
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ radar        memory       docs/retrieval
 | `cyclaw-memory` | Task Record、Fact Ledger、跨文件事务恢复与诊断、最近恢复报告、结构化证据验证账本、归档 sidecar 索引及损坏恢复、跨任务召回和知识对账。 |
 | `cyclaw-mcp` | 面向 Coding Agent 的本地 stdio JSON-RPC 接口，所有事实写入复用 Core；`doctor` 区分必需健康检查与可选能力降级，并暴露事务和最近恢复诊断。 |
 | `cyclaw-policy` | 文档写入、模型联网、自动化、路径和 Shell 权限，以及跨进程项目锁。 |
-| `cyclaw-events` | 追加式审计事件，包括 Fact Patch 创建、应用、撤销、恢复完成和恢复阻塞。 |
+| `cyclaw-events` | 追加式审计事件，包括 Fact Patch 创建、应用、撤销、恢复完成和恢复阻塞；执行事件记录命令、测试、构建和 Patch 的结果及 session/trace 关联。 |
 | `cyclaw-change-radar` | 文件事件、Git 快照和变更分类。 |
 | `cyclaw-docs` | Markdown 章节解析和五种文档治理操作。 |
 | `cyclaw-retrieval` | SQLite FTS5 索引、字面量安全查询和项目知识检索。 |
@@ -42,6 +42,6 @@ Fact 与 Fact Patch ID 在存储层执行长度、字符集和前缀校验，Pat
 
 ## 数据边界
 
-所有运行状态按项目写入 `<project>/.cyclaw/`。任务记录、Fact Ledger、对账报告、候选、Patch、索引和事件均不跨项目共享。模型调用只发生在用户配置 Provider 并授权后。
+所有运行状态按项目写入 `<project>/.cyclaw/`。任务记录、Fact Ledger、对账报告、候选、Patch、索引和事件均不跨项目共享；带 `session_id` 的活动任务指针按窗口隔离，项目级 Fact 仍可共享。模型调用只发生在用户配置 Provider 并授权后。
 
 详细设计、技术选择和阶段计划见 [技术架构](cyclaw-tech-architecture-v0.1.md)、[运行时设计](cyclaw-agent-runtime-design-v0.1.md) 和 [Agent 集成方案](cyclaw-agent-integrations-v0.1.md)。

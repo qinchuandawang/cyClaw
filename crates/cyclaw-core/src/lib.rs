@@ -166,6 +166,16 @@ pub struct ObserverState {
     pub last_success_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub events_received: u64,
+    #[serde(default)]
+    pub events_coalesced: u64,
+    #[serde(default)]
+    pub events_dropped: u64,
+    #[serde(default)]
+    pub compensating_scans: u64,
+    #[serde(default)]
+    pub analysis_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +198,11 @@ pub struct ObserverHealth {
     pub last_error: Option<String>,
     pub last_updated_at: String,
     pub running: bool,
+    pub events_received: u64,
+    pub events_coalesced: u64,
+    pub events_dropped: u64,
+    pub compensating_scans: u64,
+    pub analysis_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1459,6 +1474,11 @@ pub fn observe_project_once(project_root: &Path) -> Result<ObserverTick> {
         last_reconciled_at: None,
         last_success_at: None,
         last_error: None,
+        events_received: 0,
+        events_coalesced: 0,
+        events_dropped: 0,
+        compensating_scans: 0,
+        analysis_count: 0,
     });
     let watch = watch_project_once(project_root, state.last_snapshot.as_ref())?;
     let indexed = if watch.changed || !index_path(project_root).exists() {
@@ -1567,6 +1587,11 @@ pub fn observer_health(project_root: &Path) -> Result<ObserverHealth> {
             last_error: None,
             last_updated_at: String::new(),
             running: false,
+            events_received: 0,
+            events_coalesced: 0,
+            events_dropped: 0,
+            compensating_scans: 0,
+            analysis_count: 0,
         });
     };
     let running = lock_exists(project_root, "observer");
@@ -1589,7 +1614,34 @@ pub fn observer_health(project_root: &Path) -> Result<ObserverHealth> {
         last_error: state.last_error,
         last_updated_at: state.updated_at,
         running,
+        events_received: state.events_received,
+        events_coalesced: state.events_coalesced,
+        events_dropped: state.events_dropped,
+        compensating_scans: state.compensating_scans,
+        analysis_count: state.analysis_count,
     })
+}
+
+pub fn record_observer_metrics(
+    project_root: &Path,
+    received: u64,
+    coalesced: u64,
+    dropped: u64,
+    compensating: u64,
+) -> Result<()> {
+    let state_path = observer_state_path(project_root);
+    let Some(mut state) = read_observer_state(project_root)? else {
+        return Ok(());
+    };
+    state.events_received = state.events_received.saturating_add(received);
+    state.events_coalesced = state.events_coalesced.saturating_add(coalesced);
+    state.events_dropped = state.events_dropped.saturating_add(dropped);
+    state.compensating_scans = state.compensating_scans.saturating_add(compensating);
+    state.analysis_count = state
+        .analysis_count
+        .saturating_add(received.saturating_sub(coalesced));
+    state.updated_at = Utc::now().to_rfc3339();
+    write_observer_state(&state_path, &state)
 }
 
 fn read_observer_state(project_root: &Path) -> Result<Option<ObserverState>> {

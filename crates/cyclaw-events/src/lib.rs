@@ -84,6 +84,14 @@ pub struct ExecutionEvent {
     pub timed_out: bool,
     pub related_files: Vec<String>,
     pub error_summary: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub git_commit: Option<String>,
+    #[serde(default)]
+    pub duration_millis: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +141,35 @@ pub fn new_execution_event(
     related_files: Vec<String>,
     error_summary: Option<String>,
 ) -> ExecutionEvent {
+    new_execution_event_with_context(
+        source,
+        kind,
+        command_summary,
+        exit_code,
+        timed_out,
+        related_files,
+        error_summary,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn new_execution_event_with_context(
+    source: impl Into<String>,
+    kind: ExecutionEventKind,
+    command_summary: impl Into<String>,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    related_files: Vec<String>,
+    error_summary: Option<String>,
+    session_id: Option<String>,
+    trace_id: Option<String>,
+    git_commit: Option<String>,
+    duration_millis: Option<u128>,
+) -> ExecutionEvent {
     let command_summary = command_summary.into();
     let id = new_id("execution");
     ExecutionEvent {
@@ -154,6 +191,10 @@ pub fn new_execution_event(
         timed_out,
         related_files,
         error_summary,
+        session_id,
+        trace_id,
+        git_commit,
+        duration_millis,
     }
 }
 
