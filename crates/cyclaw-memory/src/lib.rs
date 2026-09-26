@@ -187,6 +187,10 @@ pub struct ProjectFact {
     pub created_at: String,
     pub updated_at: String,
     pub last_verified_at: String,
+    /// 单调递增修订号：preview 生成 after 快照与 upsert 合并时递增。
+    /// 用于多写者冲突检测（apply 指纹校验的配套可读版本）与审计。
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// 可定位且可验证的事实证据。旧版 `evidence: Vec<String>` 仍可被读取。
@@ -735,6 +739,7 @@ pub fn record_decision_for_session(
             created_at: now.clone(),
             updated_at: now.clone(),
             last_verified_at: now,
+            revision: 0,
         },
     )?;
     record_event(
@@ -800,6 +805,7 @@ pub fn record_failed_approach_for_session(
             confidence: 95,
             valid_from: task.git_head.clone(),
             valid_until: None,
+            revision: 0,
             supersedes: Vec::new(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -931,6 +937,7 @@ pub fn project_fact_from_input(input: FactInput) -> ProjectFact {
         created_at: now.clone(),
         updated_at: now.clone(),
         last_verified_at: now.clone(),
+        revision: 0,
     };
     normalize_fact(&mut fact, &now);
     fact
@@ -1369,6 +1376,17 @@ pub fn preview_fact_patch(project_root: &Path, request: FactPatchRequest) -> Res
     }
 
     let preview_fingerprint = facts_fingerprint(&before);
+    // OCC：after 快照携带递增后的修订号。递增在 preview 阶段完成，
+    // 使 apply 指纹校验与事务恢复重放共享一致的版本语义：
+    // 同一事实被其他写入者先行修改后，本草稿的指纹校验会失败并要求重新预览。
+    for fact in &mut after {
+        let base = before
+            .iter()
+            .find(|before_fact| before_fact.id == fact.id)
+            .map(|before_fact| before_fact.revision)
+            .unwrap_or(0);
+        fact.revision = base.saturating_add(1);
+    }
     let id = item_id("fact_patch", &format!("{:?}", request.operation), &now);
     let patch = FactPatch {
         id,
@@ -2077,6 +2095,7 @@ fn upsert_fact(project_root: &Path, mut fact: ProjectFact) -> Result<ProjectFact
         existing.confidence = existing.confidence.max(fact.confidence);
         existing.updated_at = Utc::now().to_rfc3339();
         existing.last_verified_at = existing.updated_at.clone();
+        existing.revision = existing.revision.saturating_add(1);
         let result = existing.clone();
         write_facts(project_root, &facts)?;
         return Ok(result);
@@ -2136,6 +2155,9 @@ fn normalize_fact(fact: &mut ProjectFact, now: &str) {
 
 fn prepare_fact(project_root: &Path, fact: &mut ProjectFact, now: &str) {
     normalize_fact(fact, now);
+    if fact.revision == 0 {
+        fact.revision = 1;
+    }
     let git_head = current_git_head(project_root);
     for evidence in &mut fact.evidence_details {
         if evidence.captured_at.is_empty() {
@@ -3071,6 +3093,7 @@ mod tests {
             created_at: now.clone(),
             updated_at: now.clone(),
             last_verified_at: now,
+            revision: 0,
         }
     }
 
@@ -3240,6 +3263,107 @@ mod tests {
             list_facts(temp.path()).unwrap()[0].status,
             FactStatus::Active
         );
+    }
+
+    #[test]
+    fn fact_revision_increments_across_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let created = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Create,
+                target_fact_id: None,
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("", "接口必须幂等")),
+            },
+        )
+        .unwrap();
+        assert_eq!(created.after[0].revision, 1);
+        let created = apply_fact_patch(temp.path(), &created.id).unwrap();
+        let id = created.after[0].id.clone();
+        assert_eq!(list_facts(temp.path()).unwrap()[0].revision, 1);
+
+        let updated = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Update,
+                target_fact_id: Some(id.clone()),
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("ignored", "接口必须幂等且携带幂等键")),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.after[0].revision, 2);
+        apply_fact_patch(temp.path(), &updated.id).unwrap();
+        assert_eq!(list_facts(temp.path()).unwrap()[0].revision, 2);
+
+        // upsert 合并路径同样递增
+        let mut merged = fact("", "接口必须幂等且携带幂等键");
+        merged.confidence = 95;
+        let merged = upsert_fact(temp.path(), merged).unwrap();
+        assert_eq!(merged.revision, 3);
+    }
+
+    #[test]
+    fn stale_fact_preview_conflict_is_detected() {
+        let temp = tempfile::tempdir().unwrap();
+        let created = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Create,
+                target_fact_id: None,
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("", "构建产物不入库")),
+            },
+        )
+        .unwrap();
+        apply_fact_patch(temp.path(), &created.id).unwrap();
+        let fact_id = created.after[0].id.clone();
+
+        // agent A 生成 update 草稿（基于 revision=1）
+        let stale = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Update,
+                target_fact_id: Some(fact_id.clone()),
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("ignored", "构建产物不入库，除非显式授权")),
+            },
+        )
+        .unwrap();
+
+        // agent B 先行修改同一事实（模拟并发写入者）
+        let concurrent = preview_fact_patch(
+            temp.path(),
+            FactPatchRequest {
+                operation: FactOperation::Update,
+                target_fact_id: Some(fact_id.clone()),
+                source_fact_ids: Vec::new(),
+                fact: Some(fact("ignored", "构建产物不入库，由 CI 清理")),
+            },
+        )
+        .unwrap();
+        apply_fact_patch(temp.path(), &concurrent.id).unwrap();
+
+        // agent A 应用过期草稿：指纹校验必须拒绝
+        let error = apply_fact_patch(temp.path(), &stale.id).unwrap_err();
+        assert!(error.to_string().contains("已变化"));
+    }
+
+    #[test]
+    fn legacy_facts_without_revision_default_to_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_memory_dirs(temp.path()).unwrap();
+        let legacy = r#"{"id":"fact_legacy","statement":"旧版事实","fact_type":"constraint","status":"active","evidence":[],"source_task_id":null,"confidence":80,"valid_from":null,"valid_until":null,"supersedes":[],"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-01T00:00:00Z","last_verified_at":"2025-01-01T00:00:00Z"}"#;
+        fs::write(
+            memory_dir(temp.path()).join("facts.jsonl"),
+            format!("{legacy}\n"),
+        )
+        .unwrap();
+
+        let facts = list_facts(temp.path()).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].revision, 0);
     }
 
     #[test]

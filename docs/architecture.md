@@ -42,6 +42,6 @@ Fact 与 Fact Patch ID 在存储层执行长度、字符集和前缀校验，Pat
 
 ## 数据边界
 
-所有运行状态按项目写入 `<project>/.cyclaw/`。任务记录、Fact Ledger、对账报告、候选、Patch、索引和事件均不跨项目共享；带 `session_id` 的活动任务指针按窗口隔离，项目级 Fact 仍可共享。Agent 模型审查状态写入 `.cyclaw/agent-run-state.json`，失败后可按相同 run_id 恢复；审查失败同时进入 `.cyclaw/retry-queue.json` 重试队列，按指数退避异步重试，耗尽后降级为人工处理并写入审计事件。模型审查支持可选的双角色模式：审查者结论经独立怀疑者对抗性复核后按确定性规则融合，怀疑者失败自动降级为单角色结果。模型调用只发生在用户配置 Provider 并授权后。链路追踪数据写入 `.cyclaw/traces.jsonl` 与 `.cyclaw/model-calls.jsonl`，run_id 兼作 trace_id，推理明细仅保留脱敏预览，写入失败不阻断主链路。
+所有运行状态按项目写入 `<project>/.cyclaw/`。任务记录、Fact Ledger、对账报告、候选、Patch、索引和事件均不跨项目共享；带 `session_id` 的活动任务指针按窗口隔离，项目级 Fact 仍可共享。Agent 模型审查状态写入 `.cyclaw/agent-run-state.json`，失败后可按相同 run_id 恢复；审查失败同时进入 `.cyclaw/retry-queue.json` 重试队列，按指数退避异步重试，耗尽后降级为人工处理并写入审计事件。模型审查支持可选的双角色模式：审查者结论经独立怀疑者对抗性复核后按确定性规则融合，怀疑者失败自动降级为单角色结果。模型调用只发生在用户配置 Provider 并授权后。链路追踪数据写入 `.cyclaw/traces.jsonl` 与 `.cyclaw/model-calls.jsonl`，run_id 兼作 trace_id，推理明细仅保留脱敏预览，写入失败不阻断主链路。Fact Ledger 具备乐观并发控制：每条 Fact 携带单调递增的 `revision`，草稿预览时记录目标快照指纹，应用时校验——多个写入者（多会话 Agent、Observer、人工）并发修改同一事实时，后应用者被显式拒绝并要求重新预览，不会静默覆盖。
 
 详细设计、技术选择和阶段计划见 [技术架构](cyclaw-tech-architecture-v0.1.md)、[运行时设计](cyclaw-agent-runtime-design-v0.1.md) 和 [Agent 集成方案](cyclaw-agent-integrations-v0.1.md)。
