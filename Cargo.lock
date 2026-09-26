@@ -376,6 +376,7 @@ version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
+ "cyclaw-events",
  "cyclaw-policy",
  "reqwest",
  "serde",
@@ -389,6 +390,7 @@ name = "cyclaw-policy"
 version = "0.1.6"
 dependencies = [
  "anyhow",
+ "cyclaw-events",
  "serde",
  "serde_yaml",
  "tempfile",

@@ -3,7 +3,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use cyclaw_agent::{AgentRunOptions, run_agent_once};
+use cyclaw_agent::{
+    AgentRunOptions, RetryRunOptions, abandon_retry_task, run_agent_once, run_due_retries,
+};
 use cyclaw_core::TaskPhase;
 use cyclaw_core::{
     BeginTaskOptions, DraftOptions, FactEvidence, FactInput, FactOperation, FactPatchQuery,
@@ -29,7 +31,10 @@ use cyclaw_core::{
     update_inbox_status, verify_fact_evidence as verify_fact_evidence_core, watch_project_once,
 };
 use cyclaw_docs::{DocumentPatchStatus, KnowledgeOperation};
-use cyclaw_events::{ExecutionEventKind, new_execution_event, read_events};
+use cyclaw_events::{
+    ExecutionEventKind, ModelCallRecord, RetryStatus, new_execution_event_with_context,
+    read_events, read_execution_events, read_model_calls, read_retry_queue, read_trace_spans,
+};
 use cyclaw_knowledge::KnowledgeStatus;
 use cyclaw_model::{list_providers, read_model_usage};
 use cyclaw_policy::{load_or_default, set_permission};
@@ -198,12 +203,54 @@ impl McpServer {
                 "inputSchema": object_schema(vec![("limit", json!({ "type": "integer", "minimum": 1, "maximum": 100 }))])
             }),
             json!({
+                "name": "list_traces",
+                "description": "读取本地链路追踪索引：按 trace_id 聚合 span 数量、错误数与总耗时。",
+                "inputSchema": object_schema(vec![("limit", json!({ "type": "integer", "minimum": 1, "maximum": 100 }))])
+            }),
+            json!({
+                "name": "get_trace",
+                "description": "按 trace_id 还原完整调用链，包含 span 树、大模型推理路径和关联执行事件；Agent 运行记录的 run_id 即其 trace_id。",
+                "inputSchema": object_schema_with_required(
+                    vec![("trace_id", json!({ "type": "string" }))],
+                    &["trace_id"]
+                )
+            }),
+            json!({
+                "name": "list_model_calls",
+                "description": "读取大模型推理调用明细：provider、token 用量、延迟、重试次数、缓存命中与脱敏输入输出预览。",
+                "inputSchema": object_schema(vec![
+                    ("limit", json!({ "type": "integer", "minimum": 1, "maximum": 100 })),
+                    ("provider", json!({ "type": "string" }))
+                ])
+            }),
+            json!({
+                "name": "list_retries",
+                "description": "读取失败任务重试队列：状态、尝试次数、退避计划与降级原因。",
+                "inputSchema": object_schema(vec![
+                    ("limit", json!({ "type": "integer", "minimum": 1, "maximum": 100 })),
+                    ("status", json!({ "type": "string", "enum": ["pending", "in_progress", "completed", "exhausted", "abandoned"] }))
+                ])
+            }),
+            json!({
+                "name": "run_retries",
+                "description": "立即执行所有到期重试任务：恢复失败上下文后重新运行模型审查，失败按指数退避重排，耗尽后降级为人工处理。",
+                "inputSchema": object_schema(vec![("limit", json!({ "type": "integer", "minimum": 1, "maximum": 50 }))])
+            }),
+            json!({
+                "name": "abandon_retry",
+                "description": "人工放弃一条重试任务（确认是逻辑错误而非瞬态故障），降级为人工处理。",
+                "inputSchema": object_schema_with_required(
+                    vec![("retry_id", json!({ "type": "string" }))],
+                    &["retry_id"]
+                )
+            }),
+            json!({
                 "name": "list_agent_runs",
                 "description": "读取最近 Agent 运行记录。",
                 "inputSchema": object_schema(vec![("limit", json!({ "type": "integer", "minimum": 1, "maximum": 50 }))])
             }),
             json!({"name":"analyze_changes","description":"执行一次增量知识分析，生成新的候选知识。","inputSchema":object_schema(vec![])}),
-            json!({"name":"record_execution_event","description":"记录构建、测试、命令或 Patch 的执行结果；失败仅生成待审知识候选，不直接写入 Fact。","inputSchema":object_schema_with_required(vec![("kind",json!({"type":"string","enum":["command","build","test","patch"]})),("command_summary",json!({"type":"string","maxLength":500})),("exit_code",json!({"type":"integer"})),("timed_out",json!({"type":"boolean"})),("error_summary",json!({"type":"string","maxLength":2000})),("related_files",json!({"type":"array","items":{"type":"string"},"maxItems":50}))], &["kind","command_summary"])}),
+            json!({"name":"record_execution_event","description":"记录构建、测试、命令或 Patch 的执行结果；失败仅生成待审知识候选，不直接写入 Fact。可传 trace_id/session_id 关联调用链。","inputSchema":object_schema_with_required(vec![("kind",json!({"type":"string","enum":["command","build","test","patch"]})),("command_summary",json!({"type":"string","maxLength":500})),("exit_code",json!({"type":"integer"})),("timed_out",json!({"type":"boolean"})),("error_summary",json!({"type":"string","maxLength":2000})),("related_files",json!({"type":"array","items":{"type":"string"},"maxItems":50})),("session_id",json!({"type":"string"})),("trace_id",json!({"type":"string"})),("duration_millis",json!({"type":"integer","minimum":0}))], &["kind","command_summary"])}),
             json!({"name":"get_candidate_detail","description":"按 ID 读取候选知识、证据和已有草稿。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"}))])}),
             json!({"name":"preview_document_patch","description":"为候选生成或读取文档草稿，支持 create/update/merge/supersede/delete，不修改目标文档。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"})),("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("selector",json!({"type":"string","description":"Markdown 章节标题或 candidate:<ID>"})),("source_selectors",json!({"type":"array","items":{"type":"string"}})),("replacement_content",json!({"type":"string"})),("delete_target_document",json!({"type":"boolean"}))])}),
             json!({"name":"review_candidate","description":"接受或忽略候选；接受时可用五种知识操作生成草稿。","inputSchema":object_schema(vec![("candidate_id",json!({"type":"string"})),("action",json!({"type":"string","enum":["accept","ignore"]})),("generate_draft",json!({"type":"boolean"})),("operation",json!({"type":"string","enum":["create","update","merge","supersede","delete"]})),("selector",json!({"type":"string"})),("source_selectors",json!({"type":"array","items":{"type":"string"}})),("replacement_content",json!({"type":"string"})),("delete_target_document",json!({"type":"boolean"}))])}),
@@ -267,6 +314,10 @@ impl McpServer {
                     | "get_model_providers"
                     | "get_model_usage"
                     | "list_events"
+                    | "list_traces"
+                    | "get_trace"
+                    | "list_model_calls"
+                    | "list_retries"
                     | "list_agent_runs"
                     | "get_candidate_detail"
                     | "list_fact_patches"
@@ -307,6 +358,12 @@ impl McpServer {
             "get_model_providers" => self.get_model_providers()?,
             "get_model_usage" => self.get_model_usage()?,
             "list_events" => self.list_events(arguments)?,
+            "list_traces" => self.list_traces(arguments)?,
+            "get_trace" => self.get_trace(arguments)?,
+            "list_model_calls" => self.list_model_calls(arguments)?,
+            "list_retries" => self.list_retries(arguments)?,
+            "run_retries" => self.run_retries(arguments)?,
+            "abandon_retry" => self.abandon_retry(arguments)?,
             "list_agent_runs" => self.list_agent_runs(arguments)?,
             "analyze_changes" => self.analyze_changes()?,
             "record_execution_event" => self.record_execution_event(arguments)?,
@@ -471,6 +528,165 @@ impl McpServer {
         }))
     }
 
+    /// 按 trace_id 聚合 span，输出最近链路索引。
+    fn list_traces(&self, arguments: Value) -> Result<Value> {
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let mut grouped: std::collections::BTreeMap<String, (String, usize, usize, u128)> =
+            std::collections::BTreeMap::new();
+        for span in read_trace_spans(&self.project_root)? {
+            let entry = grouped
+                .entry(span.trace_id.clone())
+                .or_insert_with(|| (span.started_at.clone(), 0, 0, 0));
+            entry.1 += 1;
+            if span.status == cyclaw_events::TraceSpanStatus::Error {
+                entry.2 += 1;
+            }
+            entry.3 = entry.3.saturating_add(span.duration_millis);
+        }
+        let mut traces: Vec<Value> = grouped
+            .into_iter()
+            .map(
+                |(trace_id, (started_at, span_count, error_count, total_duration_millis))| {
+                    json!({
+                        "trace_id": trace_id,
+                        "started_at": started_at,
+                        "span_count": span_count,
+                        "error_count": error_count,
+                        "total_duration_millis": total_duration_millis,
+                    })
+                },
+            )
+            .collect();
+        traces.sort_by(|a, b| {
+            b.get("started_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .cmp(
+                    a.get("started_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+        });
+        traces.truncate(limit);
+        Ok(json!({
+            "count": traces.len(),
+            "traces": traces,
+            "source_path": ".cyclaw/traces.jsonl"
+        }))
+    }
+
+    /// 还原一条完整链路：span 树 + 大模型推理明细 + 关联执行事件。
+    fn get_trace(&self, arguments: Value) -> Result<Value> {
+        let trace_id = required_string(&arguments, "trace_id")?;
+        let spans: Vec<Value> = read_trace_spans(&self.project_root)?
+            .into_iter()
+            .filter(|span| span.trace_id == trace_id)
+            .map(|span| json!(span))
+            .collect();
+        let model_calls: Vec<ModelCallRecord> = read_model_calls(&self.project_root)?
+            .into_iter()
+            .filter(|call| call.trace_id.as_deref() == Some(trace_id))
+            .collect();
+        let executions: Vec<Value> = read_execution_events(&self.project_root)?
+            .into_iter()
+            .filter(|event| event.trace_id.as_deref() == Some(trace_id))
+            .map(|event| json!(event))
+            .collect();
+        Ok(json!({
+            "trace_id": trace_id,
+            "span_count": spans.len(),
+            "spans": spans,
+            "model_calls": model_calls,
+            "execution_events": executions,
+            "source_path": ".cyclaw/traces.jsonl"
+        }))
+    }
+
+    fn list_model_calls(&self, arguments: Value) -> Result<Value> {
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let provider = arguments.get("provider").and_then(Value::as_str);
+        let mut calls: Vec<ModelCallRecord> = read_model_calls(&self.project_root)?
+            .into_iter()
+            .filter(|call| provider.map(|name| call.provider == name).unwrap_or(true))
+            .collect();
+        calls.reverse();
+        calls.truncate(limit);
+        Ok(json!({
+            "count": calls.len(),
+            "calls": calls,
+            "source_path": ".cyclaw/model-calls.jsonl"
+        }))
+    }
+
+    /// 读取失败任务重试队列，可按状态过滤。
+    fn list_retries(&self, arguments: Value) -> Result<Value> {
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let status = arguments.get("status").and_then(Value::as_str);
+        let mut tasks: Vec<cyclaw_events::RetryTask> = read_retry_queue(&self.project_root)?
+            .into_iter()
+            .filter(|task| {
+                status
+                    .map(|name| {
+                        matches!(
+                            (name, &task.status),
+                            ("pending", RetryStatus::Pending)
+                                | ("in_progress", RetryStatus::InProgress)
+                                | ("completed", RetryStatus::Completed)
+                                | ("exhausted", RetryStatus::Exhausted)
+                                | ("abandoned", RetryStatus::Abandoned)
+                        )
+                    })
+                    .unwrap_or(true)
+            })
+            .collect();
+        tasks.reverse();
+        tasks.truncate(limit);
+        Ok(json!({
+            "count": tasks.len(),
+            "tasks": tasks,
+            "source_path": ".cyclaw/retry-queue.json"
+        }))
+    }
+
+    /// 立即执行所有到期重试。
+    fn run_retries(&self, arguments: Value) -> Result<Value> {
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 50) as usize;
+        let result = run_due_retries(RetryRunOptions {
+            project_root: self.project_root.clone(),
+            limit,
+        })?;
+        Ok(json!({
+            "executed": result.executed,
+            "completed": result.completed,
+            "scheduled": result.scheduled,
+            "exhausted": result.exhausted,
+            "outcomes": result.outcomes,
+        }))
+    }
+
+    /// 人工放弃一条重试任务。
+    fn abandon_retry(&self, arguments: Value) -> Result<Value> {
+        let retry_id = required_string(&arguments, "retry_id")?;
+        let outcome = abandon_retry_task(&self.project_root, retry_id)?;
+        Ok(json!({ "outcome": outcome }))
+    }
+
     fn list_events(&self, arguments: Value) -> Result<Value> {
         let limit = arguments
             .get("limit")
@@ -562,7 +778,19 @@ impl McpServer {
             .and_then(Value::as_str)
             .map(|value| value.chars().take(2000).collect());
         let related_files = optional_string_array(&arguments, "related_files")?;
-        let event = new_execution_event(
+        let session_id = arguments
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let trace_id = arguments
+            .get("trace_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let duration_millis = arguments
+            .get("duration_millis")
+            .and_then(Value::as_u64)
+            .map(|value| value as u128);
+        let event = new_execution_event_with_context(
             "mcp",
             kind,
             command_summary,
@@ -570,6 +798,10 @@ impl McpServer {
             timed_out,
             related_files,
             error_summary,
+            session_id,
+            trace_id,
+            None,
+            duration_millis,
         );
         let result = record_execution_event(self.project_root.clone(), event)?;
         Ok(json!({"duplicate":result.duplicate,"candidate":result.candidate}))
@@ -1441,6 +1673,8 @@ fn is_write_tool(name: &str) -> bool {
             | "set_task_phase"
             | "reconcile_project_knowledge"
             | "close_task"
+            | "run_retries"
+            | "abandon_retry"
     )
 }
 
@@ -1592,6 +1826,7 @@ mod tests {
             api_key_env: "CYCLAW_TEST_KEY".to_string(),
             thinking_enabled: false,
             set_active: true,
+            fallback_provider: None,
         })
         .unwrap();
         let server = McpServer::new(temp.path().to_path_buf());

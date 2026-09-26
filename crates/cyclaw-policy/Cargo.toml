@@ -12,3 +12,4 @@ serde_yaml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+cyclaw-events = { path = "../cyclaw-events" }

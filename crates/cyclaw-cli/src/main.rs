@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use cyclaw_agent::{AgentRunOptions, cleanup_agent_runs, list_agent_runs, run_agent_once};
+use cyclaw_agent::{
+    AgentRunOptions, RetryRunOptions, abandon_retry_task, cleanup_agent_runs, list_agent_runs,
+    run_agent_once, run_due_retries,
+};
 use cyclaw_core::{
     BeginTaskOptions, DiffOptions, DraftOptions, EvidenceHashScope, FactEvidence, FactInput,
     FactOperation, FactPatch, FactPatchQuery, FactPatchRequest, FactPatchStatus, FactType,
@@ -26,7 +29,11 @@ use cyclaw_core::{
     search_project, update_inbox_status, verify_fact_evidence, watch_project_once,
 };
 use cyclaw_docs::KnowledgeOperation;
-use cyclaw_events::{ExecutionEventKind, new_execution_event_with_context};
+use cyclaw_events::{
+    ExecutionEventKind, ModelCallRecord, RetryStatus, TraceSpan, TraceSpanKind, TraceSpanStatus,
+    append_trace_span, new_execution_event_with_context, new_span_id, new_trace_id, new_trace_span,
+    now_rfc3339, read_execution_events, read_model_calls, read_retry_queue, read_trace_spans,
+};
 use cyclaw_knowledge::{KnowledgeImportance, KnowledgeStatus};
 use cyclaw_model::{
     AddProviderOptions, TestProviderOptions, add_provider, list_providers, test_provider,
@@ -179,6 +186,16 @@ enum Commands {
     Events {
         #[command(subcommand)]
         command: EventsCommand,
+    },
+    /// 查询本地链路追踪数据
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
+    /// 管理失败任务的重试队列
+    Retry {
+        #[command(subcommand)]
+        command: RetryCommand,
     },
     /// 管理 cyClaw 生命周期 Hooks
     Hooks {
@@ -512,6 +529,9 @@ enum ModelCommand {
         /// 将该 Provider 设置为 active
         #[arg(long, default_value_t = true)]
         active: bool,
+        /// 请求失败时自动降级使用的备用 Provider 名称
+        #[arg(long)]
+        fallback: Option<String>,
     },
     /// 查看已配置模型 Provider
     List {
@@ -537,6 +557,18 @@ enum ModelCommand {
         /// 项目根目录，默认使用当前目录
         #[arg(short, long)]
         path: Option<PathBuf>,
+    },
+    /// 查看大模型推理调用明细（推理路径）
+    Calls {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// 返回数量上限
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+        /// 按 Provider 名称过滤
+        #[arg(long)]
+        provider: Option<String>,
     },
 }
 
@@ -786,6 +818,60 @@ enum EventsCommand {
 }
 
 #[derive(Subcommand)]
+enum TraceCommand {
+    /// 查看最近的链路追踪
+    List {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// 返回数量上限
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 按 trace_id 还原完整调用链（含大模型推理路径）
+    Show {
+        /// 链路 ID；Agent 运行记录的 run_id 即其 trace_id
+        trace_id: String,
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RetryCommand {
+    /// 查看重试队列
+    List {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// 返回数量上限
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+        /// 按状态过滤：pending/in_progress/completed/exhausted/abandoned
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// 立即执行所有到期重试；恢复失败上下文后重新运行模型审查
+    Run {
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// 单次执行上限
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// 人工放弃一条重试任务，降级为人工处理
+    Abandon {
+        /// 重试任务 ID
+        retry_id: String,
+        /// 项目根目录，默认使用当前目录
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum HooksCommand {
     /// 运行一个 Hook 事件
     Run {
@@ -911,6 +997,11 @@ fn main() -> Result<()> {
             };
             let executable = command.first().context("缺少要执行的命令")?;
             let started = std::time::Instant::now();
+            // 链路追踪：外部传入 trace_id 时沿用，否则为本次执行生成独立链路。
+            let resolved_trace_id = trace_id.clone().unwrap_or_else(new_trace_id);
+            let span_id = new_span_id();
+            let span_started_at = now_rfc3339();
+            let command_summary = command.join(" ");
             // 使用临时文件承接输出，避免大输出填满管道导致子进程死锁。
             let stdout_file = NamedTempFile::new()?;
             let stderr_file = NamedTempFile::new()?;
@@ -930,17 +1021,42 @@ fn main() -> Result<()> {
                     let event = new_execution_event_with_context(
                         "cyclaw-cli",
                         event_kind,
-                        command.join(" "),
+                        command_summary.clone(),
                         status.code(),
                         false,
-                        related_files,
+                        related_files.clone(),
                         error_summary,
                         session_id,
                         trace_id,
                         git_head(&project_root),
                         Some(started.elapsed().as_millis()),
                     );
-                    let result = record_execution_event(project_root, event)?;
+                    let result = record_execution_event(project_root.clone(), event)?;
+                    let _ = append_trace_span(
+                        &project_root,
+                        &new_trace_span(
+                            resolved_trace_id,
+                            span_id,
+                            None,
+                            "exec",
+                            TraceSpanKind::Exec,
+                            "cyclaw-cli",
+                            if status.success() {
+                                TraceSpanStatus::Ok
+                            } else {
+                                TraceSpanStatus::Error
+                            },
+                            span_started_at,
+                            now_rfc3339(),
+                            serde_json::json!({
+                                "kind": kind,
+                                "command": command_summary,
+                                "exit_code": status.code(),
+                                "timed_out": false,
+                                "related_files": related_files,
+                            }),
+                        ),
+                    );
                     print!("{}", stdout);
                     eprint!("{}", stderr);
                     eprintln!("cyClaw 执行事件已记录: duplicate={}", result.duplicate);
@@ -953,10 +1069,10 @@ fn main() -> Result<()> {
                     let event = new_execution_event_with_context(
                         "cyclaw-cli",
                         event_kind,
-                        command.join(" "),
+                        command_summary.clone(),
                         status.code(),
                         true,
-                        related_files,
+                        related_files.clone(),
                         Some(if stderr.trim().is_empty() {
                             format!("命令执行超过 {} 秒", timeout_seconds)
                         } else {
@@ -971,7 +1087,28 @@ fn main() -> Result<()> {
                         git_head(&project_root),
                         Some(started.elapsed().as_millis()),
                     );
-                    let result = record_execution_event(project_root, event)?;
+                    let result = record_execution_event(project_root.clone(), event)?;
+                    let _ = append_trace_span(
+                        &project_root,
+                        &new_trace_span(
+                            resolved_trace_id,
+                            span_id,
+                            None,
+                            "exec",
+                            TraceSpanKind::Exec,
+                            "cyclaw-cli",
+                            TraceSpanStatus::Timeout,
+                            span_started_at,
+                            now_rfc3339(),
+                            serde_json::json!({
+                                "kind": kind,
+                                "command": command_summary,
+                                "exit_code": status.code(),
+                                "timed_out": true,
+                                "related_files": related_files,
+                            }),
+                        ),
+                    );
                     eprintln!(
                         "cyClaw 执行超时，事件已记录: duplicate={}",
                         result.duplicate
@@ -1087,6 +1224,34 @@ fn main() -> Result<()> {
                                 report.stale_count,
                                 report.drift_count
                             );
+                            // 空闲期自动恢复：执行所有到期的失败重试，无需人工值守。
+                            match run_due_retries(RetryRunOptions {
+                                project_root: project_root.clone(),
+                                limit: 5,
+                            }) {
+                                Ok(result) if result.executed > 0 => {
+                                    println!(
+                                        "Observer 重试恢复: 执行 {}，完成 {}，继续退避 {}，耗尽降级 {}",
+                                        result.executed,
+                                        result.completed,
+                                        result.scheduled,
+                                        result.exhausted
+                                    );
+                                    for outcome in &result.outcomes {
+                                        println!(
+                                            "- [{}] {} {}",
+                                            format!("{:?}", outcome.status),
+                                            outcome.retry_id,
+                                            outcome.detail
+                                        );
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    // 重试恢复失败不影响观察器主循环，下一周期再试。
+                                    let _ = record_observer_error(&project_root, &error);
+                                }
+                            }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             anyhow::bail!("文件观察通道意外关闭");
@@ -1554,6 +1719,7 @@ fn main() -> Result<()> {
                 thinking,
                 path,
                 active,
+                fallback,
             } => {
                 let project_root = resolve_path(path)?;
                 let result = add_provider(AddProviderOptions {
@@ -1564,6 +1730,7 @@ fn main() -> Result<()> {
                     api_key_env,
                     thinking_enabled: thinking,
                     set_active: active,
+                    fallback_provider: fallback,
                 })?;
                 println!("模型 Provider 已保存");
                 println!("配置文件: {}", result.config_path.display());
@@ -1585,6 +1752,9 @@ fn main() -> Result<()> {
                         "关闭"
                     }
                 );
+                if let Some(fallback) = &result.provider.fallback_provider {
+                    println!("备用 Provider: {}（请求失败时自动降级）", fallback);
+                }
                 println!("说明: API Key 不会写入项目文件，请通过环境变量提供。");
                 append_cli_event(
                     &project_root,
@@ -1609,6 +1779,9 @@ fn main() -> Result<()> {
                     println!("Base URL: {}", provider.base_url);
                     println!("模型: {}", provider.model);
                     println!("API Key 环境变量: {}", provider.api_key_env);
+                    if let Some(fallback) = &provider.fallback_provider {
+                        println!("备用 Provider: {}", fallback);
+                    }
                     println!(
                         "思考模式: {}",
                         if provider.thinking_enabled {
@@ -1630,11 +1803,71 @@ fn main() -> Result<()> {
                     project_root: resolve_path(path)?,
                     name,
                     prompt,
+                    trace: None,
                 })?;
                 println!("模型 Provider 测试成功");
                 println!("Provider: {}", result.provider_name);
                 println!("模型: {}", result.model);
                 println!("响应: {}", result.response);
+                if let Some(from) = &result.fallback_from {
+                    println!(
+                        "注意: 主 Provider {} 请求失败，本次结果来自备用 Provider",
+                        from
+                    );
+                }
+                if let Some(trace_id) = &result.trace_id {
+                    println!("链路: {}", trace_id);
+                    println!("查看推理路径: cyclaw trace show {}", trace_id);
+                }
+            }
+            ModelCommand::Calls {
+                path,
+                limit,
+                provider,
+            } => {
+                let project_root = resolve_path(path)?;
+                let mut calls: Vec<ModelCallRecord> = read_model_calls(&project_root)?
+                    .into_iter()
+                    .filter(|call| {
+                        provider
+                            .as_deref()
+                            .map(|name| call.provider == name)
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                calls.reverse();
+                println!("模型调用记录数量: {}", calls.len());
+                for call in calls.iter().take(limit) {
+                    println!();
+                    println!("ID: {}", call.id);
+                    println!("时间: {} -> {}", call.started_at, call.finished_at);
+                    println!("Provider: {} / 模型: {}", call.provider, call.model);
+                    println!("阶段: {}", call.phase.as_deref().unwrap_or("-"));
+                    println!(
+                        "状态: {:?}  尝试次数: {}  延迟: {} ms",
+                        call.status, call.attempts, call.latency_millis
+                    );
+                    println!(
+                        "Tokens: 输入 {} / 输出 {} / 合计 {}",
+                        call.input_tokens, call.output_tokens, call.total_tokens
+                    );
+                    if let Some(trace_id) = &call.trace_id {
+                        println!(
+                            "Trace: {} (span={})",
+                            trace_id,
+                            call.span_id.as_deref().unwrap_or("-")
+                        );
+                    }
+                    if let Some(prompt) = &call.prompt_preview {
+                        println!("输入预览: {}", prompt);
+                    }
+                    if let Some(response) = &call.response_preview {
+                        println!("输出预览: {}", response);
+                    }
+                    if let Some(error) = &call.error_summary {
+                        println!("错误: {}", error);
+                    }
+                }
             }
         },
         Commands::Agent { command } => match command {
@@ -1940,6 +2173,123 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Trace { command } => match command {
+            TraceCommand::List { path, limit } => {
+                let project_root = resolve_path(path)?;
+                let mut grouped: std::collections::BTreeMap<String, (String, usize, usize, u128)> =
+                    std::collections::BTreeMap::new();
+                for span in read_trace_spans(&project_root)? {
+                    let entry = grouped
+                        .entry(span.trace_id.clone())
+                        .or_insert_with(|| (span.started_at.clone(), 0, 0, 0));
+                    entry.1 += 1;
+                    if span.status == TraceSpanStatus::Error {
+                        entry.2 += 1;
+                    }
+                    entry.3 = entry.3.saturating_add(span.duration_millis);
+                }
+                let mut traces: Vec<(String, (String, usize, usize, u128))> =
+                    grouped.into_iter().collect();
+                traces.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+                println!("Trace 数量: {}", traces.len());
+                for (trace_id, (started_at, span_count, error_count, total_millis)) in
+                    traces.into_iter().take(limit)
+                {
+                    println!();
+                    println!("Trace: {}", trace_id);
+                    println!("  开始: {}", started_at);
+                    println!("  Span 数: {}", span_count);
+                    if error_count > 0 {
+                        println!("  错误 Span: {}", error_count);
+                    }
+                    println!("  Span 总耗时: {} ms", total_millis);
+                    println!("  查看链路: cyclaw trace show {}", trace_id);
+                }
+            }
+            TraceCommand::Show { trace_id, path } => {
+                let project_root = resolve_path(path)?;
+                print_trace_view(&project_root, &trace_id)?;
+            }
+        },
+        Commands::Retry { command } => match command {
+            RetryCommand::List {
+                path,
+                limit,
+                status,
+            } => {
+                let project_root = resolve_path(path)?;
+                let status_filter: Option<RetryStatus> = match status.as_deref() {
+                    Some("pending") => Some(RetryStatus::Pending),
+                    Some("in_progress") => Some(RetryStatus::InProgress),
+                    Some("completed") => Some(RetryStatus::Completed),
+                    Some("exhausted") => Some(RetryStatus::Exhausted),
+                    Some("abandoned") => Some(RetryStatus::Abandoned),
+                    Some(other) => anyhow::bail!(
+                        "未知重试状态: {}（可选 pending/in_progress/completed/exhausted/abandoned）",
+                        other
+                    ),
+                    None => None,
+                };
+                let mut tasks: Vec<_> = read_retry_queue(&project_root)?
+                    .into_iter()
+                    .filter(|task| match &status_filter {
+                        Some(filter) => &task.status == filter,
+                        None => true,
+                    })
+                    .collect();
+                tasks.reverse();
+                println!("重试任务数量: {}", tasks.len());
+                for task in tasks.iter().take(limit) {
+                    println!();
+                    println!("ID: {}", task.id);
+                    println!("类型: {:?}  状态: {:?}", task.kind, task.status);
+                    println!(
+                        "尝试: {}/{}  下次重试: {}",
+                        task.attempt_count,
+                        task.max_attempts,
+                        task.next_retry_at.as_deref().unwrap_or("-")
+                    );
+                    println!("Trace: {}", task.trace_id.as_deref().unwrap_or("-"));
+                    println!("创建: {}  更新: {}", task.created_at, task.updated_at);
+                    if let Some(error) = &task.last_error {
+                        println!("最近错误: {}", error.chars().take(200).collect::<String>());
+                    }
+                    if task.degraded {
+                        println!("已降级: {}", task.degraded_reason.as_deref().unwrap_or("-"));
+                    }
+                    println!(
+                        "载荷: {}",
+                        serde_json::to_string(&task.payload).unwrap_or_default()
+                    );
+                }
+            }
+            RetryCommand::Run { path, limit } => {
+                let project_root = resolve_path(path)?;
+                let result = run_due_retries(RetryRunOptions {
+                    project_root,
+                    limit,
+                })?;
+                println!(
+                    "到期重试: 执行 {} / 完成 {} / 继续退避 {} / 耗尽降级 {}",
+                    result.executed, result.completed, result.scheduled, result.exhausted
+                );
+                for outcome in &result.outcomes {
+                    println!(
+                        "- [{}] {} run={} {}",
+                        format!("{:?}", outcome.status),
+                        outcome.retry_id,
+                        outcome.run_id.as_deref().unwrap_or("-"),
+                        outcome.detail
+                    );
+                }
+            }
+            RetryCommand::Abandon { retry_id, path } => {
+                let project_root = resolve_path(path)?;
+                let outcome = abandon_retry_task(&project_root, &retry_id)?;
+                println!("重试任务已放弃: {}", outcome.retry_id);
+                println!("说明: {}", outcome.detail);
+            }
+        },
         Commands::Hooks { command } => match command {
             HooksCommand::Run {
                 event,
@@ -1967,6 +2317,144 @@ fn resolve_path(path: Option<PathBuf>) -> Result<PathBuf> {
 
 fn truncate_output(output: &str) -> String {
     output.chars().take(2000).collect()
+}
+
+/// 按 trace_id 还原完整链路：span 树 + 关联的大模型推理明细与执行事件。
+fn print_trace_view(project_root: &Path, trace_id: &str) -> Result<()> {
+    let mut spans: Vec<TraceSpan> = read_trace_spans(project_root)?
+        .into_iter()
+        .filter(|span| span.trace_id == trace_id)
+        .collect();
+    if spans.is_empty() {
+        println!("未找到 Trace: {}", trace_id);
+        println!("提示: agent run 的 run_id、exec/model test 的 trace 均可查询。");
+        return Ok(());
+    }
+    spans.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then(a.span_id.cmp(&b.span_id))
+    });
+
+    let model_calls: Vec<ModelCallRecord> = read_model_calls(project_root)?
+        .into_iter()
+        .filter(|call| call.trace_id.as_deref() == Some(trace_id))
+        .collect();
+    let executions: Vec<cyclaw_events::ExecutionEvent> = read_execution_events(project_root)?
+        .into_iter()
+        .filter(|event| event.trace_id.as_deref() == Some(trace_id))
+        .collect();
+
+    let known: std::collections::BTreeSet<&str> =
+        spans.iter().map(|span| span.span_id.as_str()).collect();
+    let mut children: std::collections::BTreeMap<&str, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        match span.parent_span_id.as_deref() {
+            Some(parent) if known.contains(parent) => {
+                children.entry(parent).or_default().push(index);
+            }
+            _ => roots.push(index),
+        }
+    }
+
+    println!("Trace: {}", trace_id);
+    println!("Span 数量: {}", spans.len());
+    println!();
+    let mut printed = vec![false; spans.len()];
+    fn print_span_tree(
+        spans: &[TraceSpan],
+        children: &std::collections::BTreeMap<&str, Vec<usize>>,
+        index: usize,
+        depth: usize,
+        printed: &mut [bool],
+    ) {
+        if printed[index] {
+            return;
+        }
+        printed[index] = true;
+        let span = &spans[index];
+        println!(
+            "{}{} [{:?}] {} ms (span_id={})",
+            "  ".repeat(depth),
+            span.name,
+            span.status,
+            span.duration_millis,
+            span.span_id
+        );
+        if let Some(parent) = &span.parent_span_id {
+            println!("{}  父 span: {}", "  ".repeat(depth), parent);
+        }
+        println!(
+            "{}  时间: {} -> {}  属性: {}",
+            "  ".repeat(depth),
+            span.started_at,
+            span.ended_at,
+            serde_json::to_string(&span.attributes).unwrap_or_default()
+        );
+        if let Some(child_indexes) = children.get(span.span_id.as_str()) {
+            for &child_index in child_indexes {
+                print_span_tree(spans, children, child_index, depth + 1, printed);
+            }
+        }
+    }
+    for root in roots {
+        print_span_tree(&spans, &children, root, 0, &mut printed);
+    }
+    for (index, span) in spans.iter().enumerate() {
+        if !printed[index] {
+            // 父 span 不在本 trace 中的孤儿节点兜底输出。
+            println!(
+                "{} [{:?}] {} ms (span_id={})",
+                span.name, span.status, span.duration_millis, span.span_id
+            );
+        }
+    }
+
+    if !model_calls.is_empty() {
+        println!();
+        println!("大模型推理路径:");
+        for call in model_calls {
+            println!(
+                "- [{}] {} / {}  phase={}  尝试={}  延迟={} ms  tokens={}/{}",
+                format!("{:?}", call.status),
+                call.provider,
+                call.model,
+                call.phase.as_deref().unwrap_or("-"),
+                call.attempts,
+                call.latency_millis,
+                call.input_tokens,
+                call.output_tokens,
+            );
+            if let Some(prompt) = &call.prompt_preview {
+                println!("  输入预览: {}", prompt);
+            }
+            if let Some(response) = &call.response_preview {
+                println!("  输出预览: {}", response);
+            }
+            if let Some(error) = &call.error_summary {
+                println!("  错误: {}", error);
+            }
+        }
+    }
+
+    if !executions.is_empty() {
+        println!();
+        println!("关联执行事件:");
+        for event in executions {
+            println!(
+                "- [{}] {}  exit_code={:?}  timed_out={}  duration={:?} ms",
+                format!("{:?}", event.kind),
+                event.command_summary,
+                event.exit_code,
+                event.timed_out,
+                event.duration_millis,
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn git_head(project_root: &Path) -> Option<String> {

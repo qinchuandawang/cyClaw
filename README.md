@@ -84,6 +84,11 @@ cargo run -p cyclaw-cli -- model list
 cargo run -p cyclaw-cli -- observer run --once
 cargo run -p cyclaw-cli -- policy show
 cargo run -p cyclaw-cli -- events list
+cargo run -p cyclaw-cli -- trace list
+cargo run -p cyclaw-cli -- trace show <trace-id>
+cargo run -p cyclaw-cli -- model calls list
+cargo run -p cyclaw-cli -- retry list
+cargo run -p cyclaw-cli -- retry run
 cargo run -p cyclaw-cli -- hooks run session-stop
 cargo run -p cyclaw-cli -- hooks install-git
 ```
@@ -229,6 +234,61 @@ cargo run -p cyclaw-cli -- agent runs list --limit 20
 cargo run -p cyclaw-cli -- agent runs clean --keep 20
 ```
 
+## 候选审查双角色（可选）
+
+单次 LLM 审查存在单点偏差：审查者既是提议者又是裁决者。开启双角色后，`agent run` 的模型审查变为两阶段——**审查者**照常给出 keep/ignore 与置信度，**怀疑者**（critic）只针对所有 keep 结论做对抗性复核：
+
+```yaml
+# .cyclaw/config.yaml
+model_policy:
+  review_critic_enabled: true
+```
+
+融合规则是确定性且可解释的：`confirm` 保留审查者结论；`downgrade` 取两者中更低的置信度；`reject` 改为 ignore 并取更低置信度。怀疑者只复核 keep 候选（无 keep 时跳过调用，不产生额外成本）；怀疑者调用失败不否决审查者结论，自动降级为单角色结果并在 step 与 trace 中留痕。两次调用均写入 `ModelCalled` 事件（`role` 字段区分）与链路追踪（phase 区分），重试队列语义不变。注意：开启后每次审查为两次模型调用，请相应调整 `daily_token_budget`。
+
+## 可观测性：链路追踪与大模型推理路径
+
+cyClaw 为每次 Agent 运行、命令执行和模型推理保留本地链路数据，用于回答“一次任务发生了什么、一次推理是怎么发生的、一次执行失败意味着什么”：
+
+```text
+.cyclaw/traces.jsonl        TraceSpan：trace_id / span_id / parent_span_id 构成的链路树
+.cyclaw/model-calls.jsonl   大模型推理明细：tokens、延迟、重试次数、缓存命中、脱敏输入输出预览
+.cyclaw/execution-events.jsonl  执行事件（已有），与 trace_id 显式关联
+```
+
+Agent run 的 `run_id` 即其 `trace_id`，一次运行形成 `agent_run -> model_review -> model_call` 的完整链路；`cyclaw exec` 沿用外部传入的 `--trace-id` 或自动生成。查询入口：
+
+```powershell
+cyclaw trace list --limit 20          # 最近链路索引：span 数、错误数、总耗时
+cyclaw trace show <trace-id>          # 还原完整链路 + 推理路径 + 关联执行事件
+cyclaw model calls list               # 大模型推理明细，支持 --provider 过滤
+```
+
+MCP 侧提供 `list_traces`、`get_trace` 和 `list_model_calls`，Coding Agent 可在失败后直接回放链路。推理明细只保存脱敏后的 240 字符预览，观测写入失败不阻断主流程；完整设计见 [可观测性设计](docs/cyclaw-observability-v0.1.md)。
+
+## 可靠性：失败重试与降级
+
+模型审查等 AI 任务失败时（网络抖动、限流、预算不足、超时），cyClaw 将失败上下文持久化到 `.cyclaw/retry-queue.json`，按指数退避（60s 起、翻倍增长、1 小时封顶）计划异步重试，无需人工值守：
+
+```powershell
+cyclaw retry list                  # 查看队列：状态、尝试次数、下次重试时间
+cyclaw retry run                   # 立即执行所有到期重试
+cyclaw retry abandon <retry-id>    # 确认是逻辑错误时人工放弃
+```
+
+重试就是"带失败上下文的又一次完整 run"：候选重新收集、审查重新执行，产物与普通 run 一致（运行记录、推理明细、trace 可查）。重试耗尽（默认 5 次尝试）后任务标记 `degraded` 并写入 `RetryTaskExhausted` 审计事件——**候选知识保持待审状态，模型不写入任何文档**，自动化失败永远不转化为未授权写入。MCP 侧提供 `list_retries`、`run_retries` 和 `abandon_retry`，Coding Agent 可在会话开始时自动恢复上次遗留的失败任务；常驻 Observer 也会在维护周期空闲时自动执行到期重试。
+
+重试参数可按项目覆盖（`.cyclaw/config.yaml`）：
+
+```yaml
+model_policy:
+  retry_base_delay_seconds: 60
+  retry_max_attempts: 5
+  retry_max_backoff_seconds: 3600
+```
+
+Provider 支持降级链：`cyclaw model add primary ... --fallback backup`，主 Provider 请求失败（网络、HTTP、解析）时自动切换备用 Provider 重试一次，两次调用均写入推理明细（`fallback_from` 标记来源）。完整状态机与设计取舍见 [可靠性设计](docs/cyclaw-reliability-v0.1.md)。
+
 ## MCP 工具
 
 当前 `cyclaw mcp` 暴露读取、分析和受控写入工具：
@@ -243,6 +303,10 @@ cargo run -p cyclaw-cli -- agent runs clean --keep 20
 - `preview_document_patch`：生成或复用草稿，不修改目标文档。
 - `apply_document_patch`、`revert_document_patch`：应用或撤销通过权限检查的文档变更。
 - `get_model_usage`：读取当日模型调用次数、Token 用量和日预算。
+- `list_traces`、`get_trace`：按 trace_id 聚合或还原完整调用链，含大模型推理路径。
+- `list_model_calls`：读取大模型推理明细：Provider、Token、延迟、重试、缓存命中与脱敏预览。
+- `list_retries`：读取失败任务重试队列：状态、尝试次数、退避计划与降级原因。
+- `run_retries`、`abandon_retry`：立即执行到期重试，或人工放弃并降级为人工处理。
 - `cyclaw exec --kind test -- cargo test`：通过统一命令包装器执行测试、构建或其他命令，自动记录退出码、超时、错误摘要、Git commit、session_id 和 trace_id，并将失败送入候选层。
 - MCP `begin_task` 可传入 `session_id`；不同窗口的活动任务指针按 session 隔离，项目级 Fact 仍可共享。
 - `get_active_task`、`get_task_context`、`checkpoint_task` 和 `close_task` 同样支持 `session_id`，显式 task_id 也会校验任务归属。

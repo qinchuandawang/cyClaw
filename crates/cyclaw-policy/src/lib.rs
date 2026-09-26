@@ -166,6 +166,18 @@ pub struct ModelPolicy {
     pub max_output_tokens: usize,
     #[serde(default = "default_daily_model_tokens")]
     pub daily_token_budget: usize,
+    /// 任务级重试退避基准（秒）：第 n 次重试延迟 = base * 2^(n-1)。
+    #[serde(default = "default_retry_base_delay_seconds")]
+    pub retry_base_delay_seconds: i64,
+    /// 任务级重试上限（含首次执行），耗尽后降级为人工处理。
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: usize,
+    /// 任务级退避上限（秒），避免等待时间无限增长。
+    #[serde(default = "default_retry_max_backoff_seconds")]
+    pub retry_max_backoff_seconds: i64,
+    /// 开启候选知识审查的双角色模式：审查者之外增加对抗性怀疑者复核。
+    #[serde(default)]
+    pub review_critic_enabled: bool,
 }
 
 fn default_model_input_tokens() -> usize {
@@ -176,6 +188,15 @@ fn default_model_output_tokens() -> usize {
 }
 fn default_daily_model_tokens() -> usize {
     100000
+}
+fn default_retry_base_delay_seconds() -> i64 {
+    60
+}
+fn default_retry_max_attempts() -> usize {
+    5
+}
+fn default_retry_max_backoff_seconds() -> i64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -329,6 +350,10 @@ pub fn default_policy() -> PolicyConfig {
             max_input_tokens: default_model_input_tokens(),
             max_output_tokens: default_model_output_tokens(),
             daily_token_budget: default_daily_model_tokens(),
+            retry_base_delay_seconds: default_retry_base_delay_seconds(),
+            retry_max_attempts: default_retry_max_attempts(),
+            retry_max_backoff_seconds: default_retry_max_backoff_seconds(),
+            review_critic_enabled: false,
         },
         automation: AutomationPolicy {},
     }
@@ -438,6 +463,30 @@ fn policy_from_yaml(value: serde_yaml::Value) -> PolicyConfig {
         {
             policy.model_policy.daily_token_budget = value.max(1) as usize;
         }
+        if let Some(value) = model_policy
+            .get("retry_base_delay_seconds")
+            .and_then(|value| value.as_i64())
+        {
+            policy.model_policy.retry_base_delay_seconds = value.max(0);
+        }
+        if let Some(value) = model_policy
+            .get("retry_max_attempts")
+            .and_then(|value| value.as_u64())
+        {
+            policy.model_policy.retry_max_attempts = value.max(1) as usize;
+        }
+        if let Some(value) = model_policy
+            .get("retry_max_backoff_seconds")
+            .and_then(|value| value.as_i64())
+        {
+            policy.model_policy.retry_max_backoff_seconds = value.max(1);
+        }
+        if let Some(value) = model_policy
+            .get("review_critic_enabled")
+            .and_then(|value| value.as_bool())
+        {
+            policy.model_policy.review_critic_enabled = value;
+        }
     }
     policy
 }
@@ -503,5 +552,55 @@ mod tests {
         let result = check_write_path_with_policy(&policy, ".env", PermissionLevel::DocsWrite);
 
         assert!(!result.allowed);
+    }
+
+    #[test]
+    fn retry_policy_defaults_match_events_constants() {
+        let policy = default_policy();
+        // 两侧默认值必须一致，events 的 new_retry_task 使用自身常量初始化。
+        assert_eq!(
+            policy.model_policy.retry_base_delay_seconds,
+            cyclaw_events::RETRY_BASE_DELAY_SECONDS
+        );
+        assert_eq!(
+            policy.model_policy.retry_max_attempts,
+            cyclaw_events::RETRY_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            policy.model_policy.retry_max_backoff_seconds,
+            cyclaw_events::RETRY_MAX_BACKOFF_SECONDS
+        );
+    }
+
+    #[test]
+    fn retry_policy_is_overridable_from_yaml() {
+        let value: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_policy:
+  retry_base_delay_seconds: 5
+  retry_max_attempts: 2
+  retry_max_backoff_seconds: 600
+"#,
+        )
+        .unwrap();
+        let policy = policy_from_yaml(value);
+        assert_eq!(policy.model_policy.retry_base_delay_seconds, 5);
+        assert_eq!(policy.model_policy.retry_max_attempts, 2);
+        assert_eq!(policy.model_policy.retry_max_backoff_seconds, 600);
+    }
+
+    #[test]
+    fn review_critic_disabled_by_default_and_overridable() {
+        // 默认关闭：单角色成本不变
+        assert!(!default_policy().model_policy.review_critic_enabled);
+
+        let value: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+model_policy:
+  review_critic_enabled: true
+"#,
+        )
+        .unwrap();
+        assert!(policy_from_yaml(value).model_policy.review_critic_enabled);
     }
 }

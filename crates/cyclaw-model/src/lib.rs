@@ -4,10 +4,17 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use cyclaw_events::{
+    ModelCallRecord, ModelCallStatus, TraceSpanKind, TraceSpanStatus, append_model_call,
+    append_trace_span, new_id, new_span_id, new_trace_id, new_trace_span,
+};
 use cyclaw_policy::{PermissionLevel, acquire_lock, check_model_call, load_or_default};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tempfile::NamedTempFile;
+
+/// 模型调用明细中 prompt / response / 错误摘要的最大保留字符数。
+const MODEL_CALL_PREVIEW_CHARS: usize = 240;
 
 const CYCLE_DIR: &str = ".cyclaw";
 const MODEL_CONFIG_FILE: &str = "model-providers.yaml";
@@ -22,6 +29,8 @@ pub struct AddProviderOptions {
     pub api_key_env: String,
     pub thinking_enabled: bool,
     pub set_active: bool,
+    /// 请求失败时自动降级使用的备用 Provider。
+    pub fallback_provider: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +38,16 @@ pub struct TestProviderOptions {
     pub project_root: PathBuf,
     pub name: String,
     pub prompt: String,
+    /// 链路追踪上下文；None 时为本次调用生成独立 trace。
+    pub trace: Option<TraceContext>,
+}
+
+/// 调用方贯通的链路上下文：trace_id 由上层任务生成，模型调用作为其子 span。
+#[derive(Debug, Clone)]
+pub struct TraceContext {
+    pub trace_id: String,
+    pub parent_span_id: Option<String>,
+    pub phase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +65,9 @@ pub struct ModelProviderConfig {
     pub api_key_env: String,
     #[serde(default)]
     pub thinking_enabled: bool,
+    /// 主 Provider 请求失败时自动降级使用的备用 Provider 名称。
+    #[serde(default)]
+    pub fallback_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +100,13 @@ pub struct TestProviderResult {
     pub total_tokens: usize,
     pub latency_millis: u128,
     pub cache_hit: bool,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub span_id: Option<String>,
+    /// 非 None 表示本次结果来自从该 Provider 降级切换后的备用 Provider。
+    #[serde(default)]
+    pub fallback_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,6 +138,7 @@ pub fn add_provider(options: AddProviderOptions) -> Result<AddProviderResult> {
         model: options.model,
         api_key_env: options.api_key_env,
         thinking_enabled: options.thinking_enabled,
+        fallback_provider: options.fallback_provider,
     };
 
     config
@@ -177,23 +207,126 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
     } else {
         options.prompt.clone()
     };
-    let cache_key = cache_key(&options.name, provider, &prompt);
+
+    // 可观测性上下文：外部传入 trace 时沿用其 trace_id 并挂到父 span 下，
+    // 否则为本次调用生成独立链路，保证每次推理都可以被回放。
+    let (trace_id, parent_span_id, phase) = match &options.trace {
+        Some(context) => (
+            context.trace_id.clone(),
+            context.parent_span_id.clone(),
+            context.phase.clone(),
+        ),
+        None => (new_trace_id(), None, None),
+    };
+
+    let invoke = |name: &str, provider: &ModelProviderConfig, fallback_from: Option<&str>| {
+        invoke_provider(
+            &options.project_root,
+            name,
+            provider,
+            &prompt,
+            &policy,
+            &trace_id,
+            parent_span_id.as_deref(),
+            phase.as_deref(),
+            fallback_from,
+        )
+    };
+
+    match invoke(&options.name, provider, None) {
+        Ok(result) => Ok(result),
+        Err(main_error) => {
+            let Some((fallback_name, fallback_provider)) = resolve_fallback(
+                &config.providers,
+                &options.name,
+                provider.fallback_provider.as_deref(),
+            ) else {
+                return Err(main_error);
+            };
+            // 备用 Provider 同样失败时保留主错误；两次失败均已写入推理明细。
+            match invoke(fallback_name, fallback_provider, Some(&options.name)) {
+                Ok(mut result) => {
+                    result.fallback_from = Some(options.name.clone());
+                    Ok(result)
+                }
+                Err(_) => Err(main_error),
+            }
+        }
+    }
+}
+
+/// 解析备用 Provider：未配置或指向自身时返回 None（不降级）。
+fn resolve_fallback<'a>(
+    providers: &'a BTreeMap<String, ModelProviderConfig>,
+    name: &str,
+    fallback_provider: Option<&str>,
+) -> Option<(&'a str, &'a ModelProviderConfig)> {
+    let fallback_name = fallback_provider?;
+    if fallback_name == name {
+        return None;
+    }
+    providers
+        .get_key_value(fallback_name)
+        .map(|(key, provider)| (key.as_str(), provider))
+}
+
+/// 对指定 Provider 执行一次完整调用：缓存、限流、预算、调用与留痕。
+#[allow(clippy::too_many_arguments)]
+fn invoke_provider(
+    project_root: &Path,
+    name: &str,
+    provider: &ModelProviderConfig,
+    prompt: &str,
+    policy: &cyclaw_policy::PolicyConfig,
+    trace_id: &str,
+    parent_span_id: Option<&str>,
+    phase: Option<&str>,
+    fallback_from: Option<&str>,
+) -> Result<TestProviderResult> {
+    let cache_key = cache_key(name, provider, prompt);
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let span_id = new_span_id();
+
     if policy.model_policy.cache_model_responses
-        && let Some(response) = read_cached_response(&options.project_root, &cache_key)?
+        && let Some(response) = read_cached_response(project_root, &cache_key)?
     {
+        let input_tokens = estimate_tokens(prompt);
+        record_model_call_outcome(
+            project_root,
+            trace_id,
+            &span_id,
+            parent_span_id,
+            name,
+            &provider.model,
+            phase,
+            ModelCallStatus::CacheHit,
+            input_tokens,
+            0,
+            input_tokens,
+            0,
+            0,
+            Some(prompt),
+            Some(&response),
+            None,
+            &started_at,
+            fallback_from,
+        );
         return Ok(TestProviderResult {
-            provider_name: options.name,
+            provider_name: name.to_string(),
             model: provider.model.clone(),
             response,
-            input_tokens: estimate_tokens(&prompt),
+            input_tokens,
             output_tokens: 0,
-            total_tokens: estimate_tokens(&prompt),
+            total_tokens: input_tokens,
             latency_millis: 0,
             cache_hit: true,
+            trace_id: Some(trace_id.to_string()),
+            span_id: Some(span_id),
+            fallback_from: fallback_from.map(ToString::to_string),
         });
     }
 
-    let estimated_input = estimate_tokens(&prompt);
+    let estimated_input = estimate_tokens(prompt);
     if estimated_input > policy.model_policy.max_input_tokens {
         anyhow::bail!(
             "模型输入超过上限: {} > {} tokens",
@@ -203,26 +336,45 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
     }
     let api_key = std::env::var(&provider.api_key_env)
         .with_context(|| format!("环境变量未设置: {}", provider.api_key_env))?;
-    enforce_min_interval(
-        &options.project_root,
-        policy.model_policy.min_interval_millis,
-    )?;
-    let reserved_tokens = reserve_daily_budget(&options.project_root, &policy, estimated_input)?;
+    enforce_min_interval(project_root, policy.model_policy.min_interval_millis)?;
+    let reserved_tokens = reserve_daily_budget(project_root, policy, estimated_input)?;
     let started = Instant::now();
-    let completion = match test_openai_compatible(
+    let attempt = match test_openai_compatible(
         provider,
         &api_key,
-        &prompt,
+        prompt,
         Duration::from_secs(policy.model_policy.request_timeout_seconds.max(1)),
         policy.model_policy.max_retries,
         policy.model_policy.max_output_tokens,
     ) {
-        Ok(completion) => completion,
-        Err(error) => {
-            release_reserved_usage(&options.project_root, reserved_tokens)?;
-            return Err(error);
+        Ok(attempt) => attempt,
+        Err(failure) => {
+            let _ = release_reserved_usage(project_root, reserved_tokens);
+            let latency_millis = started.elapsed().as_millis();
+            record_model_call_outcome(
+                project_root,
+                trace_id,
+                &span_id,
+                parent_span_id,
+                name,
+                &provider.model,
+                phase,
+                ModelCallStatus::Error,
+                0,
+                0,
+                0,
+                latency_millis,
+                failure.attempts,
+                Some(prompt),
+                None,
+                Some(&failure.message),
+                &started_at,
+                fallback_from,
+            );
+            return Err(anyhow::anyhow!(failure.message));
         }
     };
+    let completion = attempt.completion;
     let latency_millis = started.elapsed().as_millis();
     let input_tokens = completion.input_tokens.unwrap_or(estimated_input);
     let output_tokens = completion
@@ -232,21 +384,41 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
         .total_tokens
         .unwrap_or(input_tokens.saturating_add(output_tokens));
     if let Err(error) = record_usage(
-        &options.project_root,
+        project_root,
         input_tokens,
         output_tokens,
         total_tokens,
         reserved_tokens,
     ) {
-        let _ = release_reserved_usage(&options.project_root, reserved_tokens);
+        let _ = release_reserved_usage(project_root, reserved_tokens);
         return Err(error);
     }
     if policy.model_policy.cache_model_responses {
-        write_cached_response(&options.project_root, &cache_key, &completion.response)?;
+        write_cached_response(project_root, &cache_key, &completion.response)?;
     }
+    record_model_call_outcome(
+        project_root,
+        trace_id,
+        &span_id,
+        parent_span_id,
+        name,
+        &provider.model,
+        phase,
+        ModelCallStatus::Success,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        latency_millis,
+        attempt.attempts,
+        Some(prompt),
+        Some(&completion.response),
+        None,
+        &started_at,
+        fallback_from,
+    );
 
     Ok(TestProviderResult {
-        provider_name: options.name,
+        provider_name: name.to_string(),
         model: provider.model.clone(),
         response: completion.response,
         input_tokens,
@@ -254,7 +426,95 @@ pub fn test_provider(options: TestProviderOptions) -> Result<TestProviderResult>
         total_tokens,
         latency_millis,
         cache_hit: false,
+        trace_id: Some(trace_id.to_string()),
+        span_id: Some(span_id),
+        fallback_from: fallback_from.map(ToString::to_string),
     })
+}
+
+/// 把一次模型调用的结果写入 model-calls 与 traces 两条日志；
+/// 观测写入失败不阻断主链路，仅丢弃本次明细。
+#[allow(clippy::too_many_arguments)]
+fn record_model_call_outcome(
+    project_root: &Path,
+    trace_id: &str,
+    span_id: &str,
+    parent_span_id: Option<&str>,
+    provider_name: &str,
+    model: &str,
+    phase: Option<&str>,
+    status: ModelCallStatus,
+    input_tokens: usize,
+    output_tokens: usize,
+    total_tokens: usize,
+    latency_millis: u128,
+    attempts: usize,
+    prompt: Option<&str>,
+    response: Option<&str>,
+    error_summary: Option<&str>,
+    started_at: &str,
+    fallback_from: Option<&str>,
+) {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let record = ModelCallRecord {
+        schema_version: 1,
+        id: new_id("model_call"),
+        trace_id: Some(trace_id.to_string()),
+        span_id: Some(span_id.to_string()),
+        provider: provider_name.to_string(),
+        model: model.to_string(),
+        phase: phase.map(ToString::to_string),
+        status: status.clone(),
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        latency_millis,
+        attempts,
+        prompt_preview: prompt.and_then(preview_text),
+        response_preview: response.and_then(preview_text),
+        error_summary: error_summary
+            .map(|value| value.chars().take(MODEL_CALL_PREVIEW_CHARS).collect()),
+        fallback_from: fallback_from.map(ToString::to_string),
+        started_at: started_at.to_string(),
+        finished_at,
+    };
+    let _ = append_model_call(project_root, &record);
+
+    let span_status = match status {
+        ModelCallStatus::Error => TraceSpanStatus::Error,
+        ModelCallStatus::Success | ModelCallStatus::CacheHit => TraceSpanStatus::Ok,
+    };
+    let span = new_trace_span(
+        trace_id,
+        span_id,
+        parent_span_id.map(ToString::to_string),
+        "model_call",
+        TraceSpanKind::ModelInference,
+        "cyclaw-model",
+        span_status,
+        started_at.to_string(),
+        chrono::Utc::now().to_rfc3339(),
+        json!({
+            "span_id": span_id,
+            "provider": provider_name,
+            "model": model,
+            "phase": phase,
+            "status": record.status,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "latency_millis": latency_millis,
+            "attempts": attempts,
+            "cache_hit": record.status == ModelCallStatus::CacheHit,
+            "fallback_from": fallback_from,
+        }),
+    );
+    let _ = append_trace_span(project_root, &span);
+}
+
+fn preview_text(text: &str) -> Option<String> {
+    let preview: String = text.trim().chars().take(MODEL_CALL_PREVIEW_CHARS).collect();
+    (!preview.is_empty()).then_some(preview)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,6 +682,18 @@ struct CompletionResult {
     total_tokens: Option<usize>,
 }
 
+/// 一次成功的推理调用结果与实际尝试次数，attempts 用于推理路径回放。
+struct CompletionAttempt {
+    completion: CompletionResult,
+    attempts: usize,
+}
+
+/// 推理调用在重试耗尽或响应解析失败时的结构化失败信息。
+struct ModelCallFailure {
+    message: String,
+    attempts: usize,
+}
+
 fn test_openai_compatible(
     provider: &ModelProviderConfig,
     api_key: &str,
@@ -429,14 +701,18 @@ fn test_openai_compatible(
     timeout: Duration,
     max_retries: usize,
     max_output_tokens: usize,
-) -> Result<CompletionResult> {
+) -> std::result::Result<CompletionAttempt, ModelCallFailure> {
     let endpoint = format!(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
-        .build()?;
+        .build()
+        .map_err(|error| ModelCallFailure {
+            message: format!("无法创建 HTTP 客户端: {error}"),
+            attempts: 0,
+        })?;
     let request_body = json!({
         "model": provider.model,
         "messages": [
@@ -457,7 +733,9 @@ fn test_openai_compatible(
     });
     let mut last_error = "模型请求失败".to_string();
     let mut response = None;
+    let mut attempts = 0;
     for attempt in 0..=max_retries {
+        attempts = attempt + 1;
         match client
             .post(&endpoint)
             .bearer_auth(api_key)
@@ -480,17 +758,24 @@ fn test_openai_compatible(
             std::thread::sleep(Duration::from_millis(backoff));
         }
     }
-    let response = response
-        .with_context(|| format!("模型请求失败，已重试 {} 次: {}", max_retries, last_error))?;
+    let Some(response) = response else {
+        return Err(ModelCallFailure {
+            message: format!("模型请求失败，已重试 {} 次: {}", max_retries, last_error),
+            attempts,
+        });
+    };
 
-    let value: serde_json::Value = response.json().context("模型响应不是合法 JSON")?;
+    let value: serde_json::Value = response.json().map_err(|error| ModelCallFailure {
+        message: format!("模型响应不是合法 JSON: {error}"),
+        attempts,
+    })?;
 
     let message = value
         .get("choices")
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("message"));
 
-    let content = message
+    let Some(content) = message
         .and_then(|message| message.get("content"))
         .and_then(|content| content.as_str())
         .or_else(|| {
@@ -500,20 +785,27 @@ fn test_openai_compatible(
         })
         .map(str::trim)
         .filter(|content| !content.is_empty())
-        .map(ToString::to_string)
-        .with_context(|| format!("模型响应缺少 choices[0].message.content: {}", value))?;
+    else {
+        return Err(ModelCallFailure {
+            message: format!("模型响应缺少 choices[0].message.content: {}", value),
+            attempts,
+        });
+    };
     let usage = value.get("usage");
-    Ok(CompletionResult {
-        response: content,
-        input_tokens: usage
-            .and_then(|v| v.get("prompt_tokens").and_then(|n| n.as_u64()))
-            .map(|n| n as usize),
-        output_tokens: usage
-            .and_then(|v| v.get("completion_tokens").and_then(|n| n.as_u64()))
-            .map(|n| n as usize),
-        total_tokens: usage
-            .and_then(|v| v.get("total_tokens").and_then(|n| n.as_u64()))
-            .map(|n| n as usize),
+    Ok(CompletionAttempt {
+        completion: CompletionResult {
+            response: content.to_string(),
+            input_tokens: usage
+                .and_then(|v| v.get("prompt_tokens").and_then(|n| n.as_u64()))
+                .map(|n| n as usize),
+            output_tokens: usage
+                .and_then(|v| v.get("completion_tokens").and_then(|n| n.as_u64()))
+                .map(|n| n as usize),
+            total_tokens: usage
+                .and_then(|v| v.get("total_tokens").and_then(|n| n.as_u64()))
+                .map(|n| n as usize),
+        },
+        attempts,
     })
 }
 
@@ -703,6 +995,7 @@ mod tests {
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             thinking_enabled: false,
             set_active: true,
+            fallback_provider: None,
         })
         .unwrap();
 
@@ -725,6 +1018,7 @@ mod tests {
                 api_key_env: "EXAMPLE_API_KEY".to_string(),
                 thinking_enabled: false,
                 set_active: name == "first",
+                fallback_provider: None,
             })
             .unwrap();
         }
@@ -754,5 +1048,55 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn fallback_resolution_rejects_missing_and_self_references() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "primary".to_string(),
+            ModelProviderConfig {
+                provider_type: ModelProviderType::OpenAiCompatible,
+                base_url: "https://example.com".to_string(),
+                model: "example".to_string(),
+                api_key_env: "EXAMPLE_API_KEY".to_string(),
+                thinking_enabled: false,
+                fallback_provider: None,
+            },
+        );
+        providers.insert("backup".to_string(), providers["primary"].clone());
+
+        // 正常降级
+        let (name, provider) = resolve_fallback(&providers, "primary", Some("backup")).unwrap();
+        assert_eq!(name, "backup");
+        assert_eq!(provider.api_key_env, "EXAMPLE_API_KEY");
+        // 指向自身：不降级
+        assert!(resolve_fallback(&providers, "primary", Some("primary")).is_none());
+        // 未配置：不降级
+        assert!(resolve_fallback(&providers, "primary", None).is_none());
+        // 备用名称不存在：不降级
+        assert!(resolve_fallback(&providers, "primary", Some("ghost")).is_none());
+    }
+
+    #[test]
+    fn add_provider_persists_fallback_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        add_provider(AddProviderOptions {
+            project_root: temp.path().to_path_buf(),
+            name: "primary".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            model: "example".to_string(),
+            api_key_env: "EXAMPLE_API_KEY".to_string(),
+            thinking_enabled: false,
+            set_active: true,
+            fallback_provider: Some("backup".to_string()),
+        })
+        .unwrap();
+
+        let providers = list_providers(temp.path().to_path_buf()).unwrap();
+        assert_eq!(
+            providers.providers["primary"].fallback_provider.as_deref(),
+            Some("backup")
+        );
     }
 }
