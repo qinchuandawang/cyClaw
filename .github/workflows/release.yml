@@ -47,7 +47,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           $source = if ($env:RUNNER_OS -eq 'Windows') { 'target/release/cyclaw.exe' } else { 'target/release/cyclaw' }
           Copy-Item $source "release/cyclaw-$env:ASSET_NAME$env:EXTENSION"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cyclaw-cli-${{ matrix.asset_name }}
           path: release/*
@@ -70,7 +70,7 @@ jobs:
       - name: 打包 VSIX
         shell: pwsh
         run: ./scripts/package-vscode.ps1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cyclaw-vscode-windows-x64
           path: apps/vscode/*.vsix
@@ -88,7 +88,7 @@ jobs:
       - name: 打包插件
         working-directory: apps/idea
         run: ./gradlew buildPlugin --no-daemon
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cyclaw-idea-plugin
           path: apps/idea/build/distributions/*.zip
