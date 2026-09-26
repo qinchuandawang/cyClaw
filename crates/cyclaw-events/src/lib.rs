@@ -340,8 +340,6 @@ pub fn new_trace_span(
     ended_at: String,
     attributes: serde_json::Value,
 ) -> TraceSpan {
-    let started_at = started_at;
-    let ended_at = ended_at;
     let duration_millis = match (
         chrono::DateTime::parse_from_rfc3339(&started_at),
         chrono::DateTime::parse_from_rfc3339(&ended_at),

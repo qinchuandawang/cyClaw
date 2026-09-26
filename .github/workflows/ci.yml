@@ -36,14 +36,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # pnpm 必须先于 setup-node 安装：cache: pnpm 需要 pnpm 已在 PATH 中。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: apps/vscode/pnpm-lock.yaml
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.9.0
       - name: 安装与检查
         working-directory: apps/vscode
         run: |

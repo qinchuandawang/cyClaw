@@ -1239,10 +1239,8 @@ fn main() -> Result<()> {
                                     );
                                     for outcome in &result.outcomes {
                                         println!(
-                                            "- [{}] {} {}",
-                                            format!("{:?}", outcome.status),
-                                            outcome.retry_id,
-                                            outcome.detail
+                                            "- [{:?}] {} {}",
+                                            outcome.status, outcome.retry_id, outcome.detail
                                         );
                                     }
                                 }
@@ -2275,8 +2273,8 @@ fn main() -> Result<()> {
                 );
                 for outcome in &result.outcomes {
                     println!(
-                        "- [{}] {} run={} {}",
-                        format!("{:?}", outcome.status),
+                        "- [{:?}] {} run={} {}",
+                        outcome.status,
                         outcome.retry_id,
                         outcome.run_id.as_deref().unwrap_or("-"),
                         outcome.detail
@@ -2417,8 +2415,8 @@ fn print_trace_view(project_root: &Path, trace_id: &str) -> Result<()> {
         println!("大模型推理路径:");
         for call in model_calls {
             println!(
-                "- [{}] {} / {}  phase={}  尝试={}  延迟={} ms  tokens={}/{}",
-                format!("{:?}", call.status),
+                "- [{:?}] {} / {}  phase={}  尝试={}  延迟={} ms  tokens={}/{}",
+                call.status,
                 call.provider,
                 call.model,
                 call.phase.as_deref().unwrap_or("-"),
@@ -2444,8 +2442,8 @@ fn print_trace_view(project_root: &Path, trace_id: &str) -> Result<()> {
         println!("关联执行事件:");
         for event in executions {
             println!(
-                "- [{}] {}  exit_code={:?}  timed_out={}  duration={:?} ms",
-                format!("{:?}", event.kind),
+                "- [{:?}] {}  exit_code={:?}  timed_out={}  duration={:?} ms",
+                event.kind,
                 event.command_summary,
                 event.exit_code,
                 event.timed_out,
